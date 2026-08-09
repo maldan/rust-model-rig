@@ -1,0 +1,20 @@
+[package]
+name = "model-rig"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+mega-render = { path = "../../../rust_lib/mega/render" }
+mega-ui = { path = "../../../rust_lib/mega/ui", features = ["wgpu"] }
+glam = "0.33.2"
+wgpu = "30"
+winit = "0.30"
+pollster = "0.4"
+env_logger = "0.11"
+log = "0.4"
+arboard = "3"
+rfd = "0.15"
+
+[target.'cfg(windows)'.dependencies]
+# Keep in sync with mega-ui / wgpu-hal (see mega-ui Cargo.toml).
+windows = "0.62"
