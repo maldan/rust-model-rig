@@ -1,48 +1,34 @@
-//! Rotation gizmo (RGB axis rings). FK = change selected bone local rotation;
-//! children follow via the scene-graph parent chain.
+//! Rotation gizmo: draw via mega-render [`DebugDraw::gizmo`], FK via local bone rotation.
 
 use std::f32::consts::TAU;
 
 use glam::{Mat3, Quat, Vec2, Vec3};
-use mega_render::Scene;
+use mega_render::{
+    gizmo_ring_basis, gizmo_screen_size, GizmoAxis, GizmoMode, GizmoOpts, GizmoRotateArc, Scene,
+};
 use mega_ui::Rect;
 
 use crate::pick::{project_world_to_screen, ray_from_viewport, Ray};
 use crate::rig::BoneId;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Axis {
-    X,
-    Y,
-    Z,
-}
-
-impl Axis {
-    pub fn color(self) -> [f32; 4] {
-        match self {
-            Self::X => [1.0, 0.15, 0.12, 1.0],
-            Self::Y => [0.2, 1.0, 0.25, 1.0],
-            Self::Z => [0.2, 0.45, 1.0, 1.0],
-        }
-    }
-
-    pub fn all() -> [Axis; 3] {
-        [Self::X, Self::Y, Self::Z]
-    }
-}
-
 #[derive(Clone, Copy)]
 pub struct RotateDrag {
     pub bone: BoneId,
-    pub axis: Axis,
+    pub axis: GizmoAxis,
     pub world_axis: Vec3,
     pub origin: Vec3,
     pub start_local_rot: Quat,
     pub start_angle: f32,
+    pub current_angle: f32,
+    /// Frozen ring basis at grab (for rotate-arc feedback).
+    pub u: Vec3,
+    pub v: Vec3,
 }
 
-pub fn gizmo_radius(_scene: &Scene, _bone: BoneId, hint_len: f32) -> f32 {
-    (hint_len * 0.95).clamp(0.1, 1.25)
+pub fn gizmo_radius(scene: &Scene, bone: BoneId, viewport_h: f32) -> f32 {
+    let origin = scene.world_matrix(bone.node).transform_point3(Vec3::ZERO);
+    let dist = (scene.camera.eye - origin).length();
+    gizmo_screen_size(dist, scene.camera.fov_y, viewport_h, 110.0).clamp(0.06, 2.0)
 }
 
 pub fn bone_world_basis(scene: &Scene, bone: BoneId) -> Option<(Vec3, Mat3)> {
@@ -58,88 +44,51 @@ pub fn bone_world_basis(scene: &Scene, bone: BoneId) -> Option<(Vec3, Mat3)> {
     Some((origin, Mat3::from_cols(x, y, z)))
 }
 
-fn world_axis_of(basis: Mat3, axis: Axis) -> Vec3 {
+fn world_axis_of(basis: Mat3, axis: GizmoAxis) -> Vec3 {
     match axis {
-        Axis::X => basis.x_axis,
-        Axis::Y => basis.y_axis,
-        Axis::Z => basis.z_axis,
+        GizmoAxis::X => basis.x_axis,
+        GizmoAxis::Y => basis.y_axis,
+        GizmoAxis::Z => basis.z_axis,
+        _ => basis.y_axis,
     }
+}
+
+fn rotate_axes() -> [GizmoAxis; 3] {
+    [GizmoAxis::X, GizmoAxis::Y, GizmoAxis::Z]
 }
 
 pub fn draw_gizmo(
     scene: &mut Scene,
     bone: BoneId,
     radius: f32,
-    hover: Option<Axis>,
-    active: Option<Axis>,
+    hover: Option<GizmoAxis>,
+    drag: Option<&RotateDrag>,
 ) {
     let Some((origin, basis)) = bone_world_basis(scene, bone) else {
         return;
     };
-
-    // Radial offsets for a thicker stroke (debug lines are 1px).
-    let ring_offsets: &[f32] = &[0.0, 0.025, 0.05, -0.025, -0.05];
-    let axis_pad = radius * 0.035;
-
-    for axis in Axis::all() {
-        let dir = world_axis_of(basis, axis);
-        let mut col = axis.color();
-        let hot = active == Some(axis) || hover == Some(axis);
-        if hot {
-            col[0] = (col[0] * 1.35 + 0.15).min(1.0);
-            col[1] = (col[1] * 1.35 + 0.15).min(1.0);
-            col[2] = (col[2] * 1.35 + 0.15).min(1.0);
-        }
-        col[3] = 1.0;
-        let tip = origin + dir * radius * 1.2;
-        let (t, b) = ring_basis(dir);
-        for &(u, v) in &[
-            (0.0, 0.0),
-            (axis_pad, 0.0),
-            (-axis_pad, 0.0),
-            (0.0, axis_pad),
-            (0.0, -axis_pad),
-        ] {
-            let o = t * u + b * v;
-            scene.debug.line_overlay(origin + o, tip + o, col);
-        }
-    }
-
-    const SEGMENTS: usize = 64;
-    for axis in Axis::all() {
-        let n = world_axis_of(basis, axis);
-        let (t, b) = ring_basis(n);
-        let mut col = axis.color();
-        let hot = active == Some(axis) || hover == Some(axis);
-        if hot {
-            col[0] = (col[0] * 1.35 + 0.15).min(1.0);
-            col[1] = (col[1] * 1.35 + 0.15).min(1.0);
-            col[2] = (col[2] * 1.35 + 0.15).min(1.0);
-        }
-        col[3] = 1.0;
-        for &off in ring_offsets {
-            let r = radius * (1.0 + off);
-            let mut prev = origin + t * r;
-            for i in 1..=SEGMENTS {
-                let a = (i as f32 / SEGMENTS as f32) * TAU;
-                let p = origin + (t * a.cos() + b * a.sin()) * r;
-                scene.debug.line_overlay(prev, p, col);
-                prev = p;
-            }
-        }
-    }
-}
-
-fn ring_basis(axis: Vec3) -> (Vec3, Vec3) {
-    let axis = axis.normalize_or_zero();
-    let helper = if axis.cross(Vec3::Y).length_squared() > 1e-4 {
-        Vec3::Y
-    } else {
-        Vec3::X
-    };
-    let t = axis.cross(helper).normalize_or_zero();
-    let b = axis.cross(t).normalize_or_zero();
-    (t, b)
+    let rotation = Quat::from_mat3(&basis);
+    let highlight = drag.map(|d| d.axis).or(hover);
+    let rotate_arc = drag.map(|d| GizmoRotateArc {
+        axis: d.axis,
+        u: d.u,
+        v: d.v,
+        start: d.start_angle,
+        current: d.current_angle,
+    });
+    let eye = scene.camera.eye;
+    scene.debug.gizmo(
+        origin,
+        rotation,
+        GizmoOpts {
+            mode: GizmoMode::Rotate,
+            size: radius,
+            highlight,
+            eye: Some(eye),
+            rotate_arc,
+            depth_test: false,
+        },
+    );
 }
 
 pub fn pick_axis(
@@ -148,14 +97,15 @@ pub fn pick_axis(
     viewport: Rect,
     cursor: Vec2,
     radius: f32,
-) -> Option<(Axis, f32)> {
+) -> Option<(GizmoAxis, f32, Vec3, Vec3)> {
     let ray = ray_from_viewport(scene, viewport, cursor)?;
     let (origin, basis) = bone_world_basis(scene, bone)?;
 
-    let mut best: Option<(f32, Axis, f32)> = None;
-    for axis in Axis::all() {
+    let mut best: Option<(f32, GizmoAxis, f32, Vec3, Vec3)> = None;
+    for axis in rotate_axes() {
         let n = world_axis_of(basis, axis);
-        let Some((hit, angle)) = ray_ring_hit(&ray, origin, n) else {
+        let (u, v) = gizmo_ring_basis(axis, basis.x_axis, basis.y_axis, basis.z_axis);
+        let Some((hit, angle)) = ray_ring_hit(&ray, origin, n, u, v) else {
             continue;
         };
         let depth = (hit - ray.origin).length();
@@ -165,14 +115,14 @@ pub fn pick_axis(
             continue;
         }
         let score = depth + radial_err * radius * 4.0;
-        if best.is_none_or(|(s, _, _)| score < s) {
-            best = Some((score, axis, angle));
+        if best.is_none_or(|(s, ..)| score < s) {
+            best = Some((score, axis, angle, u, v));
         }
     }
-    best.map(|(_, a, ang)| (a, ang))
+    best.map(|(_, a, ang, u, v)| (a, ang, u, v))
 }
 
-fn ray_ring_hit(ray: &Ray, origin: Vec3, axis: Vec3) -> Option<(Vec3, f32)> {
+fn ray_ring_hit(ray: &Ray, origin: Vec3, axis: Vec3, u: Vec3, v: Vec3) -> Option<(Vec3, f32)> {
     let axis = axis.normalize_or_zero();
     if axis.length_squared() < 1e-8 {
         return None;
@@ -186,9 +136,8 @@ fn ray_ring_hit(ray: &Ray, origin: Vec3, axis: Vec3) -> Option<(Vec3, f32)> {
         return None;
     }
     let hit = ray.origin + ray.dir * t;
-    let (tangent, bitangent) = ring_basis(axis);
-    let v = hit - origin;
-    let angle = v.dot(bitangent).atan2(v.dot(tangent));
+    let rel = hit - origin;
+    let angle = v.dot(rel).atan2(u.dot(rel));
     Some((hit, angle))
 }
 
@@ -199,7 +148,7 @@ pub fn begin_rotate(
     cursor: Vec2,
     radius: f32,
 ) -> Option<RotateDrag> {
-    let (axis, angle) = pick_axis(scene, bone, viewport, cursor, radius)?;
+    let (axis, angle, u, v) = pick_axis(scene, bone, viewport, cursor, radius)?;
     let (origin, basis) = bone_world_basis(scene, bone)?;
     let local = scene.nodes.get(bone.node)?.local.rotation;
     Some(RotateDrag {
@@ -209,6 +158,9 @@ pub fn begin_rotate(
         origin,
         start_local_rot: local,
         start_angle: angle,
+        current_angle: angle,
+        u,
+        v,
     })
 }
 
@@ -218,18 +170,20 @@ pub fn hover_axis(
     viewport: Rect,
     cursor: Vec2,
     radius: f32,
-) -> Option<Axis> {
-    pick_axis(scene, bone, viewport, cursor, radius).map(|(a, _)| a)
+) -> Option<GizmoAxis> {
+    pick_axis(scene, bone, viewport, cursor, radius).map(|(a, ..)| a)
 }
 
 /// Rotate selected bone only; children follow through node parents (FK).
-pub fn apply_rotate(scene: &mut Scene, drag: &RotateDrag, viewport: Rect, cursor: Vec2) {
+pub fn apply_rotate(scene: &mut Scene, drag: &mut RotateDrag, viewport: Rect, cursor: Vec2) {
     let Some(ray) = ray_from_viewport(scene, viewport, cursor) else {
         return;
     };
-    let Some((_, angle)) = ray_ring_hit(&ray, drag.origin, drag.world_axis) else {
+    let Some((_, angle)) = ray_ring_hit(&ray, drag.origin, drag.world_axis, drag.u, drag.v) else {
         return;
     };
+    drag.current_angle = angle;
+
     let mut delta = angle - drag.start_angle;
     while delta > std::f32::consts::PI {
         delta -= TAU;

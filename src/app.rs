@@ -1,11 +1,11 @@
 //! Application state, UI, and viewport tools.
 
 use glam::{Vec2, Vec3};
-use mega_render::{Scene, Visualizer, WgpuVisualizer};
+use mega_render::{GizmoAxis, Scene, Visualizer, WgpuVisualizer};
 use mega_ui::{DockNode, DockState, ScrollAxes, TextStyle, Ui};
 
 use crate::framework::{Demo, UiCtx, SCENE_TEX};
-use crate::gizmo::{self, Axis, RotateDrag};
+use crate::gizmo::{self, RotateDrag};
 use crate::pick;
 use crate::rig::{empty_scene, BoneId, RigDocument, Tool};
 
@@ -14,7 +14,7 @@ pub struct AppState {
     pub rig: RigDocument,
     pub status: String,
     pub rotate_drag: Option<RotateDrag>,
-    pub gizmo_hover: Option<Axis>,
+    pub gizmo_hover: Option<GizmoAxis>,
     /// Euler degrees shown in inspector (synced from selection).
     pub edit_euler_deg: Vec3,
     pub edit_bone: Option<BoneId>,
@@ -101,11 +101,7 @@ impl AppState {
         let Some(sel) = self.rig.selection else {
             return 0.15;
         };
-        gizmo::gizmo_radius(
-            &self.scene,
-            sel,
-            self.rig.average_bone_length(&self.scene),
-        )
+        gizmo::gizmo_radius(&self.scene, sel, self.rig.viewport_rect.height())
     }
 }
 
@@ -140,14 +136,16 @@ pub fn handle_tools(state: &mut AppState, pointer: &PointerFrame, ui_wants_mouse
 
     if state.rotate_drag.is_some() {
         if pointer.down {
-            // Split borrows: apply using a clone of drag params.
-            let drag = state.rotate_drag.clone().unwrap();
-            gizmo::apply_rotate(&mut state.scene, &drag, rect, pointer.pos);
-            if let Some(n) = state.scene.nodes.get(drag.bone.node) {
+            let bone = {
+                let drag = state.rotate_drag.as_mut().unwrap();
+                gizmo::apply_rotate(&mut state.scene, drag, rect, pointer.pos);
+                drag.bone
+            };
+            if let Some(n) = state.scene.nodes.get(bone.node) {
                 let (y, x, z) = n.local.rotation.to_euler(glam::EulerRot::YXZ);
                 state.edit_euler_deg =
                     Vec3::new(x.to_degrees(), y.to_degrees(), z.to_degrees());
-                state.edit_bone = Some(drag.bone);
+                state.edit_bone = Some(bone);
             }
         }
         return;

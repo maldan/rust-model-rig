@@ -604,13 +604,13 @@ impl<D: Demo> Host<D> {
             if self.state.rig.tool == Tool::Rotate {
                 if let Some(sel) = self.state.rig.selection {
                     let radius = self.state.gizmo_radius();
-                    let active = self.state.rotate_drag.as_ref().map(|d| d.axis);
+                    let drag = self.state.rotate_drag.as_ref();
                     gizmo::draw_gizmo(
                         &mut self.state.scene,
                         sel,
                         radius,
                         self.state.gizmo_hover,
-                        active,
+                        drag,
                     );
                 }
             }
