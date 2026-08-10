@@ -296,6 +296,13 @@ impl Demo for RigApp {
                     if ui.button(if rot { "[Rotate]" } else { "Rotate" }).clicked() {
                         state.rig.tool = Tool::Rotate;
                     }
+                    let skel = state.rig.show_skeleton;
+                    if ui
+                        .button(if skel { "[Bones]" } else { "Bones" })
+                        .clicked()
+                    {
+                        state.rig.show_skeleton = !skel;
+                    }
                     if ui.button("Reset bone").clicked() {
                         state.rig.reset_selected(&mut state.scene);
                         state.edit_bone = None;
@@ -339,49 +346,56 @@ fn bone_panel(ui: &mut Ui, state: &mut AppState) {
     );
     ui.separator();
     let avail = ui.available_size();
+    let roots = state.rig.roots();
+    let prev = state.rig.selection;
+    let mut tree_sel = prev.map(bone_tree_id);
     ui.scroll_area("bones_scroll", avail, ScrollAxes::Vertical, |ui| {
-        let roots = state.rig.roots();
         if roots.is_empty() {
             ui.label("No bones — open a skinned glTF.");
             return;
         }
-        for root in roots {
-            draw_bone_tree(ui, state, root);
-        }
+        ui.tree_scope(&mut tree_sel, |ui| {
+            for root in &roots {
+                draw_bone_tree(ui, state, *root);
+            }
+        });
     });
-}
 
-fn draw_bone_tree(ui: &mut Ui, state: &mut AppState, id: BoneId) {
-    let (name, children, selected) = {
-        let Some(b) = state.rig.bone(id) else {
-            return;
-        };
-        (
-            b.name.clone(),
-            b.children.clone(),
-            state.rig.selection == Some(id),
-        )
-    };
-    let label = if selected {
-        format!("▸ {name}")
-    } else {
-        name.clone()
-    };
-    let id_str = format!("bone_{}_{}", id.node.index, id.node.generation);
-
-    if children.is_empty() {
-        if ui.button(&label).clicked() {
-            state.rig.selection = Some(id);
-            state.edit_bone = None;
-            state.status = format!("Selected: {name}");
-        }
-    } else {
-        ui.tree_node(&id_str, &label, |ui| {
-            if ui.button(&format!("select · {name}")).clicked() {
-                state.rig.selection = Some(id);
-                state.edit_bone = None;
+    let new_sel = tree_sel.as_ref().and_then(|s| {
+        state
+            .rig
+            .bones
+            .iter()
+            .find(|b| bone_tree_id(b.id) == *s)
+            .map(|b| b.id)
+    });
+    if new_sel != prev {
+        state.rig.selection = new_sel;
+        state.edit_bone = None;
+        if let Some(id) = new_sel {
+            if let Some(name) = state.rig.bone(id).map(|b| b.name.clone()) {
                 state.status = format!("Selected: {name}");
             }
+        }
+    }
+}
+
+fn bone_tree_id(id: BoneId) -> String {
+    format!("bone_{}_{}", id.node.index, id.node.generation)
+}
+
+fn draw_bone_tree(ui: &mut Ui, state: &AppState, id: BoneId) {
+    let Some(b) = state.rig.bone(id) else {
+        return;
+    };
+    let name = b.name.clone();
+    let children = b.children.clone();
+    let id_str = bone_tree_id(id);
+
+    if children.is_empty() {
+        ui.tree_leaf(&id_str, &name);
+    } else {
+        ui.tree_node(&id_str, &name, |ui| {
             for child in children {
                 draw_bone_tree(ui, state, child);
             }

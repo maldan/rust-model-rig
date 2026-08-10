@@ -141,12 +141,13 @@ impl OrbitCam {
         let f_stop = scene.camera.f_stop;
         let near = scene.camera.near;
         let far = (self.distance * 20.0).max(50.0);
+        let near_max = (self.distance * 0.05).max(0.01);
         scene.camera = Camera::look_at(eye, self.target);
         scene.camera.focus_distance = focus_distance;
         scene.camera.focus_target = focus_target;
         scene.camera.focus_smooth = focus_smooth;
         scene.camera.f_stop = f_stop;
-        scene.camera.near = near.clamp(0.01, self.distance * 0.05);
+        scene.camera.near = near.clamp(0.01, near_max);
         scene.camera.far = far;
     }
 }
@@ -591,6 +592,14 @@ impl<D: Demo> Host<D> {
 
             // Debug / gizmo after tools so pose matches this frame.
             self.state.scene.debug.clear();
+            self.state.scene.debug.grid(
+                Vec3::ZERO,
+                2.5,
+                0.25,
+                [0.18, 0.18, 0.18, 1.0],
+                4,
+                [0.32, 0.32, 0.32, 1.0],
+            );
             draw_rig_debug(&mut self.state.scene, &self.state.rig);
             if self.state.rig.tool == Tool::Rotate {
                 if let Some(sel) = self.state.rig.selection {

@@ -20,9 +20,9 @@ pub enum Axis {
 impl Axis {
     pub fn color(self) -> [f32; 4] {
         match self {
-            Self::X => [0.95, 0.25, 0.22, 1.0],
-            Self::Y => [0.35, 0.9, 0.3, 1.0],
-            Self::Z => [0.3, 0.55, 1.0, 1.0],
+            Self::X => [1.0, 0.15, 0.12, 1.0],
+            Self::Y => [0.2, 1.0, 0.25, 1.0],
+            Self::Z => [0.2, 0.45, 1.0, 1.0],
         }
     }
 
@@ -42,7 +42,7 @@ pub struct RotateDrag {
 }
 
 pub fn gizmo_radius(_scene: &Scene, _bone: BoneId, hint_len: f32) -> f32 {
-    (hint_len * 0.55).clamp(0.04, 0.6)
+    (hint_len * 0.95).clamp(0.1, 1.25)
 }
 
 pub fn bone_world_basis(scene: &Scene, bone: BoneId) -> Option<(Vec3, Mat3)> {
@@ -77,41 +77,55 @@ pub fn draw_gizmo(
         return;
     };
 
+    // Radial offsets for a thicker stroke (debug lines are 1px).
+    let ring_offsets: &[f32] = &[0.0, 0.025, 0.05, -0.025, -0.05];
+    let axis_pad = radius * 0.035;
+
     for axis in Axis::all() {
         let dir = world_axis_of(basis, axis);
         let mut col = axis.color();
-        if active == Some(axis) || hover == Some(axis) {
-            col[0] = (col[0] * 1.2).min(1.0);
-            col[1] = (col[1] * 1.2).min(1.0);
-            col[2] = (col[2] * 1.2).min(1.0);
-            col[3] = 1.0;
-        } else {
-            col[3] = 0.85;
+        let hot = active == Some(axis) || hover == Some(axis);
+        if hot {
+            col[0] = (col[0] * 1.35 + 0.15).min(1.0);
+            col[1] = (col[1] * 1.35 + 0.15).min(1.0);
+            col[2] = (col[2] * 1.35 + 0.15).min(1.0);
         }
-        scene
-            .debug
-            .line_overlay(origin, origin + dir * radius * 1.15, col);
+        col[3] = 1.0;
+        let tip = origin + dir * radius * 1.2;
+        let (t, b) = ring_basis(dir);
+        for &(u, v) in &[
+            (0.0, 0.0),
+            (axis_pad, 0.0),
+            (-axis_pad, 0.0),
+            (0.0, axis_pad),
+            (0.0, -axis_pad),
+        ] {
+            let o = t * u + b * v;
+            scene.debug.line_overlay(origin + o, tip + o, col);
+        }
     }
 
-    const SEGMENTS: usize = 48;
+    const SEGMENTS: usize = 64;
     for axis in Axis::all() {
         let n = world_axis_of(basis, axis);
         let (t, b) = ring_basis(n);
         let mut col = axis.color();
-        let thick = active == Some(axis) || hover == Some(axis);
-        col[3] = if thick { 1.0 } else { 0.75 };
-        let mut prev = origin + t * radius;
-        for i in 1..=SEGMENTS {
-            let a = (i as f32 / SEGMENTS as f32) * TAU;
-            let p = origin + (t * a.cos() + b * a.sin()) * radius;
-            scene.debug.line_overlay(prev, p, col);
-            if thick {
-                let a0 = ((i - 1) as f32 / SEGMENTS as f32) * TAU;
-                let prev2 = origin + (t * a0.cos() + b * a0.sin()) * (radius * 1.02);
-                let p2 = origin + (t * a.cos() + b * a.sin()) * (radius * 1.02);
-                scene.debug.line_overlay(prev2, p2, col);
+        let hot = active == Some(axis) || hover == Some(axis);
+        if hot {
+            col[0] = (col[0] * 1.35 + 0.15).min(1.0);
+            col[1] = (col[1] * 1.35 + 0.15).min(1.0);
+            col[2] = (col[2] * 1.35 + 0.15).min(1.0);
+        }
+        col[3] = 1.0;
+        for &off in ring_offsets {
+            let r = radius * (1.0 + off);
+            let mut prev = origin + t * r;
+            for i in 1..=SEGMENTS {
+                let a = (i as f32 / SEGMENTS as f32) * TAU;
+                let p = origin + (t * a.cos() + b * a.sin()) * r;
+                scene.debug.line_overlay(prev, p, col);
+                prev = p;
             }
-            prev = p;
         }
     }
 }
@@ -147,7 +161,7 @@ pub fn pick_axis(
         let depth = (hit - ray.origin).length();
         let radial = (hit - origin - n * (hit - origin).dot(n)).length();
         let radial_err = (radial - radius).abs() / radius.max(1e-4);
-        if radial_err > 0.35 {
+        if radial_err > 0.45 {
             continue;
         }
         let score = depth + radial_err * radius * 4.0;

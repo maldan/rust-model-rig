@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
-use glam::Vec3;
+use glam::{Mat4, Vec3};
 use mega_render::{
     load_gltf, Camera, DirectionalLight, Handle, Light, Node, PointLight, Scene, Transform,
 };
@@ -391,8 +391,11 @@ pub fn draw_rig_debug(scene: &mut Scene, rig: &RigDocument) {
     if !rig.show_skeleton {
         return;
     }
-    let base = [1.0, 0.88, 0.2, 1.0];
+    let base = [0.25, 0.95, 0.35, 1.0];
     let sel_col = [0.15, 0.95, 1.0, 1.0];
+    let avg = rig.average_bone_length(scene);
+    let thickness = (avg * 0.08).clamp(0.008, 0.04);
+    let joint = thickness * 1.35;
     let segments = rig.bone_segments(scene);
     for (from, to, id) in &segments {
         let color = if rig.selection == Some(*id) {
@@ -400,15 +403,47 @@ pub fn draw_rig_debug(scene: &mut Scene, rig: &RigDocument) {
         } else {
             base
         };
-        // Overlay: bones were invisible inside the mesh with depth test on.
-        scene.debug.bone(*from, *to, color, false);
-        scene.debug.point_ex(*from, color, 7.0, false);
+        if let Some(m) = bone_cuboid_matrix(*from, *to, thickness) {
+            scene.debug.box_transform(m, color, false);
+        }
+        // Small joint cube at the bone origin.
+        scene.debug.box_aabb(
+            *from - Vec3::splat(joint * 0.5),
+            *from + Vec3::splat(joint * 0.5),
+            color,
+            false,
+        );
     }
+}
+
+/// Unit box `[-0.5, 0.5]³` → thin cuboid from `from` to `to` (Y along the bone).
+fn bone_cuboid_matrix(from: Vec3, to: Vec3, thickness: f32) -> Option<Mat4> {
+    let dir = to - from;
+    let len = dir.length();
+    if len < 1e-6 {
+        return None;
+    }
+    let axis = dir / len;
+    let hint = if axis.cross(Vec3::Y).length_squared() < 1e-4 {
+        Vec3::Z
+    } else {
+        Vec3::Y
+    };
+    let side = axis.cross(hint).normalize();
+    let up = side.cross(axis).normalize();
+    let mid = (from + to) * 0.5;
+    Some(Mat4::from_cols(
+        (side * thickness).extend(0.0),
+        (axis * len).extend(0.0),
+        (up * thickness).extend(0.0),
+        mid.extend(1.0),
+    ))
 }
 
 pub fn empty_scene() -> Scene {
     let mut scene = Scene::new();
     scene.ambient = [0.04, 0.04, 0.05];
+    scene.clear_color = [0.0, 0.0, 0.0, 1.0];
     if let Some(Light::Directional(d)) = scene.lights.first_mut() {
         *d = DirectionalLight {
             direction: Vec3::new(0.35, -0.55, 0.75).normalize(),
