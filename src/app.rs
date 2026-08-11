@@ -364,13 +364,23 @@ impl Demo for RigApp {
                 }
             });
             ui.menu("View", |ui| {
-                let mut skel = ctx.state.rig.show_skeleton;
-                let mut mesh = ctx.state.rig.show_mesh;
-                if ui.checkbox("Skeleton", &mut skel).changed() {
-                    ctx.state.rig.show_skeleton = skel;
+                let skel = ctx.state.rig.show_skeleton;
+                let mesh = ctx.state.rig.show_mesh;
+                if ui
+                    .menu_item(if skel {
+                        "Hide Skeleton"
+                    } else {
+                        "Show Skeleton"
+                    })
+                    .clicked()
+                {
+                    ctx.state.rig.show_skeleton = !skel;
                 }
-                if ui.checkbox("Mesh", &mut mesh).changed() {
-                    ctx.state.rig.show_mesh = mesh;
+                if ui
+                    .menu_item(if mesh { "Hide Mesh" } else { "Show Mesh" })
+                    .clicked()
+                {
+                    ctx.state.rig.show_mesh = !mesh;
                     ctx.state.rig.apply_mesh_visibility(&mut ctx.state.scene);
                 }
             });

@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 
 use glam::{Vec2, Vec3};
 use mega_render::{
-    view_gizmo, Camera, DebugView, InputFrame, PostProcessSettings, Scene, ShadowSettings,
-    Visualizer, WgpuVisualizer,
+    view_gizmo, Camera, DebugView, InputFrame, PostProcessSettings, Projection, Scene,
+    ShadowSettings, Visualizer, WgpuVisualizer,
 };
 use mega_ui::wgpu::{DrawStats, UiRenderer};
 use mega_ui::{CursorIcon, DockState, Ui, UiInput};
@@ -72,6 +72,11 @@ struct OrbitCam {
     panning: bool,
     /// Smooth snap toward (yaw, pitch).
     snap: Option<OrbitSnap>,
+    projection: Projection,
+    /// Blender-style: orbit after an axis snap returns to perspective.
+    auto_perspective: bool,
+    /// Set by view-gizmo snap; cleared when orbiting restores perspective.
+    ortho_from_view: bool,
 }
 
 struct OrbitSnap {
@@ -92,6 +97,9 @@ impl OrbitCam {
             orbiting: false,
             panning: false,
             snap: None,
+            projection: scene.camera.projection,
+            auto_perspective: true,
+            ortho_from_view: false,
         };
         cam.sync_from_camera(&scene.camera);
         cam
@@ -107,6 +115,7 @@ impl OrbitCam {
         }
         self.pitch = d.y.clamp(-1.0, 1.0).asin();
         self.yaw = d.x.atan2(d.z);
+        self.projection = camera.projection;
     }
 
     fn eye(&self) -> Vec3 {
@@ -125,6 +134,10 @@ impl OrbitCam {
 
     fn add_orbit(&mut self, dx: f32, dy: f32) {
         self.snap = None;
+        if self.auto_perspective && self.ortho_from_view {
+            self.projection = Projection::Perspective;
+            self.ortho_from_view = false;
+        }
         const SENS: f32 = 0.005;
         self.yaw += dx * SENS;
         // DeviceEvent: +dy = mouse moved down. Drag down → look from below (pitch down).
@@ -147,7 +160,7 @@ impl OrbitCam {
         self.distance = (self.distance * factor).clamp(0.05, 500.0);
     }
 
-    /// Place camera on `dir` (world), looking at target. Smooth short tween.
+    /// Place camera on `dir` (world), looking at target. Smooth short tween + ortho.
     fn snap_to_dir(&mut self, dir: Vec3) {
         let d = dir.normalize_or_zero();
         if d.length_squared() < 1e-8 {
@@ -162,6 +175,8 @@ impl OrbitCam {
             to_pitch,
             t: 0.0,
         });
+        self.projection = Projection::Orthographic;
+        self.ortho_from_view = true;
     }
 
     fn tick_snap(&mut self, dt: f32) {
@@ -187,10 +202,14 @@ impl OrbitCam {
         let focus_target = scene.camera.focus_target;
         let focus_smooth = scene.camera.focus_smooth;
         let f_stop = scene.camera.f_stop;
+        let fov_y = scene.camera.fov_y;
         let near = scene.camera.near;
         let far = (self.distance * 20.0).max(50.0);
         let near_max = (self.distance * 0.05).max(0.01);
         scene.camera = Camera::look_at(eye, self.target);
+        scene.camera.fov_y = fov_y;
+        scene.camera.projection = self.projection;
+        scene.camera.ortho_size = Camera::ortho_size_from_distance(self.distance, fov_y);
         scene.camera.focus_distance = focus_distance;
         scene.camera.focus_target = focus_target;
         scene.camera.focus_smooth = focus_smooth;
@@ -649,7 +668,7 @@ impl<D: Demo> Host<D> {
                         view_gizmo::hit_test(&self.state.scene.camera, vp_size, local)
                     {
                         self.orbit.snap_to_dir(axis.dir());
-                        self.state.status = format!("View {}", axis.label());
+                        self.state.status = format!("View {} · ortho", axis.label());
                         consumed = true;
                     }
                 }
@@ -674,9 +693,9 @@ impl<D: Demo> Host<D> {
                 Vec3::ZERO,
                 2.5,
                 0.25,
-                [0.18, 0.18, 0.18, 1.0],
+                [0.22, 0.22, 0.24, 0.10], // minor — very soft
                 4,
-                [0.32, 0.32, 0.32, 1.0],
+                [0.28, 0.28, 0.30, 0.28], // major — still muted
             );
             draw_rig_debug(&mut self.state.scene, &self.state.rig);
             if let Some(sel) = self.state.rig.selection {
