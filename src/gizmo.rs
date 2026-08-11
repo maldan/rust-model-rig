@@ -1,4 +1,4 @@
-//! Rotation gizmo: draw via mega-render [`DebugDraw::gizmo`], FK via local bone rotation.
+//! Bone gizmos: rotate (pose/edit) + translate (edit). FK via local transforms.
 
 use std::f32::consts::TAU;
 
@@ -23,6 +23,18 @@ pub struct RotateDrag {
     /// Frozen ring basis at grab (for rotate-arc feedback).
     pub u: Vec3,
     pub v: Vec3,
+}
+
+#[derive(Clone, Copy)]
+pub struct TranslateDrag {
+    pub bone: BoneId,
+    pub axis: GizmoAxis,
+    pub origin: Vec3,
+    pub axis_dir: Vec3,
+    pub plane_n: Vec3,
+    pub plane_u: Vec3,
+    pub plane_v: Vec3,
+    pub grab: Vec3,
 }
 
 pub fn gizmo_radius(scene: &Scene, bone: BoneId, viewport_h: f32) -> f32 {
@@ -57,7 +69,7 @@ fn rotate_axes() -> [GizmoAxis; 3] {
     [GizmoAxis::X, GizmoAxis::Y, GizmoAxis::Z]
 }
 
-pub fn draw_gizmo(
+pub fn draw_rotate_gizmo(
     scene: &mut Scene,
     bone: BoneId,
     radius: f32,
@@ -91,7 +103,33 @@ pub fn draw_gizmo(
     );
 }
 
-pub fn pick_axis(
+pub fn draw_translate_gizmo(
+    scene: &mut Scene,
+    bone: BoneId,
+    radius: f32,
+    hover: Option<GizmoAxis>,
+    drag: Option<&TranslateDrag>,
+) {
+    let Some((origin, basis)) = bone_world_basis(scene, bone) else {
+        return;
+    };
+    let rotation = Quat::from_mat3(&basis);
+    let highlight = drag.map(|d| d.axis).or(hover);
+    scene.debug.gizmo(
+        origin,
+        rotation,
+        GizmoOpts {
+            mode: GizmoMode::Translate,
+            size: radius,
+            highlight,
+            eye: Some(scene.camera.eye),
+            rotate_arc: None,
+            depth_test: false,
+        },
+    );
+}
+
+pub fn pick_rotate_axis(
     scene: &Scene,
     bone: BoneId,
     viewport: Rect,
@@ -141,6 +179,105 @@ fn ray_ring_hit(ray: &Ray, origin: Vec3, axis: Vec3, u: Vec3, v: Vec3) -> Option
     Some((hit, angle))
 }
 
+fn ray_plane_point(ray: &Ray, plane_o: Vec3, plane_n: Vec3) -> Option<Vec3> {
+    let n = plane_n.normalize_or_zero();
+    if n.length_squared() < 1e-8 {
+        return None;
+    }
+    let denom = ray.dir.dot(n);
+    if denom.abs() < 1e-6 {
+        return None;
+    }
+    let t = (plane_o - ray.origin).dot(n) / denom;
+    if t < 0.0 {
+        return None;
+    }
+    Some(ray.origin + ray.dir * t)
+}
+
+fn ray_segment_dist(ray: &Ray, a: Vec3, b: Vec3) -> f32 {
+    let ab = b - a;
+    let ao = a - ray.origin;
+    let ab_len_sq = ab.length_squared();
+    if ab_len_sq < 1e-12 {
+        let t = ao.dot(ray.dir).max(0.0);
+        let p = ray.origin + ray.dir * t;
+        return (p - a).length();
+    }
+    let d = ray.dir;
+    let r = ab;
+    let w0 = ray.origin - a;
+    let aa = d.dot(d);
+    let bb = r.dot(r);
+    let cc = d.dot(r);
+    let det = aa * bb - cc * cc;
+    let (t, s) = if det.abs() < 1e-10 {
+        let s = (w0.dot(r) / bb).clamp(0.0, 1.0);
+        let t = (r * s - w0).dot(d) / aa;
+        (t.max(0.0), s)
+    } else {
+        let _t = ((cc * w0.dot(r) - bb * w0.dot(d)) / det).max(0.0);
+        let s = ((aa * w0.dot(r) - cc * w0.dot(d)) / det).clamp(0.0, 1.0);
+        let t = (r * s - w0).dot(d) / aa;
+        (t.max(0.0), s)
+    };
+    let p_ray = ray.origin + d * t;
+    let p_seg = a + r * s;
+    (p_ray - p_seg).length()
+}
+
+fn ray_plane_quad_dist(ray: &Ray, origin: Vec3, u: Vec3, v: Vec3, size: f32) -> Option<f32> {
+    let n = u.cross(v).normalize_or_zero();
+    let hit = ray_plane_point(ray, origin, n)?;
+    let rel = hit - origin;
+    let su = rel.dot(u);
+    let sv = rel.dot(v);
+    let pad = size * 0.22;
+    if su < pad || sv < pad || su > size * 0.55 || sv > size * 0.55 {
+        return None;
+    }
+    Some((hit - ray.origin).length())
+}
+
+pub fn pick_translate_axis(
+    scene: &Scene,
+    bone: BoneId,
+    viewport: Rect,
+    cursor: Vec2,
+    radius: f32,
+) -> Option<GizmoAxis> {
+    let ray = ray_from_viewport(scene, viewport, cursor)?;
+    let (origin, basis) = bone_world_basis(scene, bone)?;
+    let x = basis.x_axis;
+    let y = basis.y_axis;
+    let z = basis.z_axis;
+    let thresh = radius * 0.12;
+
+    let mut best: Option<(f32, GizmoAxis)> = None;
+    let mut consider = |d: f32, axis: GizmoAxis| {
+        if best.is_none_or(|(bd, _)| d < bd) {
+            best = Some((d, axis));
+        }
+    };
+
+    for (axis, dir) in [(GizmoAxis::X, x), (GizmoAxis::Y, y), (GizmoAxis::Z, z)] {
+        let d = ray_segment_dist(&ray, origin, origin + dir * radius);
+        if d < thresh {
+            consider(d, axis);
+        }
+    }
+    for (axis, a, b) in [
+        (GizmoAxis::Xy, x, y),
+        (GizmoAxis::Yz, y, z),
+        (GizmoAxis::Zx, z, x),
+    ] {
+        if let Some(d) = ray_plane_quad_dist(&ray, origin, a, b, radius) {
+            consider(d, axis);
+        }
+    }
+    best.map(|(_, a)| a)
+}
+
 pub fn begin_rotate(
     scene: &Scene,
     bone: BoneId,
@@ -148,7 +285,7 @@ pub fn begin_rotate(
     cursor: Vec2,
     radius: f32,
 ) -> Option<RotateDrag> {
-    let (axis, angle, u, v) = pick_axis(scene, bone, viewport, cursor, radius)?;
+    let (axis, angle, u, v) = pick_rotate_axis(scene, bone, viewport, cursor, radius)?;
     let (origin, basis) = bone_world_basis(scene, bone)?;
     let local = scene.nodes.get(bone.node)?.local.rotation;
     Some(RotateDrag {
@@ -164,6 +301,52 @@ pub fn begin_rotate(
     })
 }
 
+pub fn begin_translate(
+    scene: &Scene,
+    bone: BoneId,
+    viewport: Rect,
+    cursor: Vec2,
+    radius: f32,
+) -> Option<TranslateDrag> {
+    let axis = pick_translate_axis(scene, bone, viewport, cursor, radius)?;
+    let (origin, basis) = bone_world_basis(scene, bone)?;
+    let x = basis.x_axis;
+    let y = basis.y_axis;
+    let z = basis.z_axis;
+    let ray = ray_from_viewport(scene, viewport, cursor)?;
+
+    let (axis_dir, plane_n, plane_u, plane_v) = match axis {
+        GizmoAxis::X => (x, x, y, z),
+        GizmoAxis::Y => (y, y, x, z),
+        GizmoAxis::Z => (z, z, x, y),
+        GizmoAxis::Xy => ((x + y).normalize_or_zero(), z, x, y),
+        GizmoAxis::Yz => ((y + z).normalize_or_zero(), x, y, z),
+        GizmoAxis::Zx => ((z + x).normalize_or_zero(), y, z, x),
+        GizmoAxis::Uniform => return None,
+    };
+
+    let grab = match axis {
+        GizmoAxis::X | GizmoAxis::Y | GizmoAxis::Z => {
+            let view = (scene.camera.eye - origin).normalize_or_zero();
+            let n = axis_dir.cross(view.cross(axis_dir)).normalize_or_zero();
+            ray_plane_point(&ray, origin, n).unwrap_or(origin)
+        }
+        _ => ray_plane_point(&ray, origin, plane_n).unwrap_or(origin),
+    };
+
+    scene.nodes.get(bone.node)?;
+    Some(TranslateDrag {
+        bone,
+        axis,
+        origin,
+        axis_dir,
+        plane_n,
+        plane_u,
+        plane_v,
+        grab,
+    })
+}
+
 pub fn hover_axis(
     scene: &Scene,
     bone: BoneId,
@@ -171,7 +354,17 @@ pub fn hover_axis(
     cursor: Vec2,
     radius: f32,
 ) -> Option<GizmoAxis> {
-    pick_axis(scene, bone, viewport, cursor, radius).map(|(a, ..)| a)
+    pick_rotate_axis(scene, bone, viewport, cursor, radius).map(|(a, ..)| a)
+}
+
+pub fn hover_translate_axis(
+    scene: &Scene,
+    bone: BoneId,
+    viewport: Rect,
+    cursor: Vec2,
+    radius: f32,
+) -> Option<GizmoAxis> {
+    pick_translate_axis(scene, bone, viewport, cursor, radius)
 }
 
 /// Rotate selected bone only; children follow through node parents (FK).
@@ -208,8 +401,67 @@ pub fn apply_rotate(scene: &mut Scene, drag: &mut RotateDrag, viewport: Rect, cu
     }
 }
 
+pub fn apply_translate(scene: &mut Scene, drag: &mut TranslateDrag, viewport: Rect, cursor: Vec2) {
+    let Some(ray) = ray_from_viewport(scene, viewport, cursor) else {
+        return;
+    };
+    let hit = match drag.axis {
+        GizmoAxis::X | GizmoAxis::Y | GizmoAxis::Z => {
+            let view = (scene.camera.eye - drag.origin).normalize_or_zero();
+            let n = drag
+                .axis_dir
+                .cross(view.cross(drag.axis_dir))
+                .normalize_or_zero();
+            ray_plane_point(&ray, drag.origin, n)
+        }
+        _ => ray_plane_point(&ray, drag.origin, drag.plane_n),
+    };
+    let Some(hit) = hit else {
+        return;
+    };
+    let delta = hit - drag.grab;
+    let world_new = match drag.axis {
+        GizmoAxis::X | GizmoAxis::Y | GizmoAxis::Z => {
+            drag.origin + drag.axis_dir * delta.dot(drag.axis_dir)
+        }
+        GizmoAxis::Xy | GizmoAxis::Yz | GizmoAxis::Zx => {
+            drag.origin
+                + drag.plane_u * delta.dot(drag.plane_u)
+                + drag.plane_v * delta.dot(drag.plane_v)
+        }
+        GizmoAxis::Uniform => drag.origin,
+    };
+
+    let parent_world = scene
+        .nodes
+        .get(drag.bone.node)
+        .and_then(|n| n.parent)
+        .map(|p| scene.world_matrix(p))
+        .unwrap_or(glam::Mat4::IDENTITY);
+    let local_pos = parent_world.inverse().transform_point3(world_new);
+
+    if let Some(n) = scene.nodes.get_mut(drag.bone.node) {
+        n.local.translation = local_pos;
+    }
+}
+
 #[allow(dead_code)]
 pub fn gizmo_screen_center(scene: &Scene, bone: BoneId, viewport: Rect) -> Option<Vec2> {
     let world = scene.world_matrix(bone.node).transform_point3(Vec3::ZERO);
     project_world_to_screen(scene, viewport, world)
+}
+
+/// Hit Y=0 ground (or a fallback plane facing camera through origin).
+pub fn ray_ground_hit(scene: &Scene, viewport: Rect, cursor: Vec2) -> Option<Vec3> {
+    let ray = ray_from_viewport(scene, viewport, cursor)?;
+    let denom = ray.dir.y;
+    if denom.abs() > 1e-5 {
+        let t = -ray.origin.y / denom;
+        if t > 0.0 {
+            return Some(ray.origin + ray.dir * t);
+        }
+    }
+    // Fallback: plane through origin facing camera.
+    let n = (scene.camera.eye).normalize_or_zero();
+    ray_plane_point(&ray, Vec3::ZERO, n)
 }

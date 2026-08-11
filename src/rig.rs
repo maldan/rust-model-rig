@@ -39,9 +39,21 @@ impl Hash for BoneId {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AppMode {
+    /// Create / reparent / rest-pose transforms.
+    Edit,
+    /// FK pose on top of bind (current behaviour).
+    #[default]
+    Pose,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Tool {
     #[default]
     Select,
+    /// Edit: place / extrude a child bone.
+    AddBone,
+    Translate,
     Rotate,
 }
 
@@ -64,9 +76,12 @@ pub struct RigDocument {
     pub bind_locals: HashMap<(u32, u32), Transform>,
     pub show_skeleton: bool,
     pub show_mesh: bool,
+    pub mode: AppMode,
     pub tool: Tool,
     /// Screen-space rect of the 3D viewport (updated each UI frame).
     pub viewport_rect: mega_ui::Rect,
+    /// Counter for default bone names.
+    next_bone_serial: u32,
 }
 
 impl Default for RigDocument {
@@ -80,11 +95,13 @@ impl Default for RigDocument {
             bind_locals: HashMap::new(),
             show_skeleton: true,
             show_mesh: true,
+            mode: AppMode::Pose,
             tool: Tool::Rotate,
             viewport_rect: mega_ui::Rect {
                 min: glam::Vec2::ZERO,
                 max: glam::Vec2::ZERO,
             },
+            next_bone_serial: 1,
         }
     }
 }
@@ -99,6 +116,160 @@ impl RigDocument {
         self.bone_index.clear();
         self.selection = None;
         self.bind_locals.clear();
+        self.next_bone_serial = 1;
+    }
+
+    /// Empty scene + root bone (+ tip child so a segment is visible).
+    pub fn new_skeleton(&mut self, scene: &mut Scene) {
+        self.clear_model(scene);
+        let root = self.insert_bone(scene, "Root", None, Transform::default());
+        let tip = self.insert_bone(
+            scene,
+            "Bone",
+            Some(root),
+            Transform::from_translation(Vec3::Y * 0.35),
+        );
+        self.selection = Some(tip);
+        self.capture_bind_pose(scene);
+        self.mode = AppMode::Edit;
+        self.tool = Tool::Translate;
+        self.fit_camera(scene);
+    }
+
+    pub fn set_mode(&mut self, scene: &mut Scene, mode: AppMode) {
+        if self.mode == mode {
+            return;
+        }
+        match mode {
+            AppMode::Edit => {
+                // Edit rest pose, not a temporary FK pose.
+                self.reset_pose(scene);
+                if !matches!(self.tool, Tool::Translate | Tool::AddBone | Tool::Rotate) {
+                    self.tool = Tool::Translate;
+                }
+            }
+            AppMode::Pose => {
+                self.capture_bind_pose(scene);
+                self.tool = Tool::Rotate;
+            }
+        }
+        self.mode = mode;
+    }
+
+    pub fn write_bind_for(&mut self, scene: &Scene, id: BoneId) {
+        if let Some(n) = scene.nodes.get(id.node) {
+            self.bind_locals.insert(id.node.key(), n.local);
+        }
+    }
+
+    /// Extrude a child from `parent` along local +Y.
+    pub fn extrude_bone(&mut self, scene: &mut Scene, parent: BoneId) -> Option<BoneId> {
+        if self.bone(parent).is_none() {
+            return None;
+        }
+        let len = self.average_bone_length(scene).max(0.12);
+        let name = format!("Bone_{}", self.next_bone_serial);
+        self.next_bone_serial += 1;
+        let id = self.insert_bone(
+            scene,
+            &name,
+            Some(parent),
+            Transform::from_translation(Vec3::Y * len),
+        );
+        self.selection = Some(id);
+        self.write_bind_for(scene, id);
+        Some(id)
+    }
+
+    /// New root (or orphan) at a world position.
+    pub fn add_root_at(&mut self, scene: &mut Scene, world_pos: Vec3) -> BoneId {
+        let name = format!("Bone_{}", self.next_bone_serial);
+        self.next_bone_serial += 1;
+        let id = self.insert_bone(
+            scene,
+            &name,
+            None,
+            Transform::from_translation(world_pos),
+        );
+        self.selection = Some(id);
+        self.write_bind_for(scene, id);
+        id
+    }
+
+    /// Delete bone and all descendants. Children are not reparented.
+    pub fn delete_bone_subtree(&mut self, scene: &mut Scene, id: BoneId) {
+        if self.bone(id).is_none() {
+            return;
+        }
+        let mut stack = vec![id];
+        let mut kill = Vec::new();
+        while let Some(cur) = stack.pop() {
+            if let Some(b) = self.bone(cur) {
+                stack.extend(b.children.iter().copied());
+            }
+            kill.push(cur);
+        }
+
+        let kill_set: HashSet<(u32, u32)> = kill.iter().map(|b| b.node.key()).collect();
+
+        // Detach from surviving parents' children lists.
+        for b in &mut self.bones {
+            b.children.retain(|c| !kill_set.contains(&c.node.key()));
+        }
+
+        if self.selection.is_some_and(|s| kill_set.contains(&s.node.key())) {
+            self.selection = None;
+        }
+
+        for dead in &kill {
+            self.bind_locals.remove(&dead.node.key());
+            self.bone_index.remove(&dead.node.key());
+            scene.nodes.remove(dead.node);
+        }
+        self.bones
+            .retain(|b| !kill_set.contains(&b.id.node.key()));
+        self.reindex_bones();
+    }
+
+    fn insert_bone(
+        &mut self,
+        scene: &mut Scene,
+        name: &str,
+        parent: Option<BoneId>,
+        local: Transform,
+    ) -> BoneId {
+        let node = scene.nodes.insert(Node {
+            name: name.to_string(),
+            parent: parent.map(|p| p.node),
+            local,
+            mesh: None,
+            material: None,
+            skin: None,
+            visible: true,
+        });
+        let id = BoneId { node };
+        let idx = self.bones.len();
+        self.bone_index.insert(node.key(), idx);
+        self.bones.push(BoneInfo {
+            id,
+            name: name.to_string(),
+            parent,
+            children: Vec::new(),
+            deform: false,
+        });
+        if let Some(p) = parent {
+            if let Some(&pi) = self.bone_index.get(&p.node.key()) {
+                self.bones[pi].children.push(id);
+            }
+        }
+        id
+    }
+
+    fn reindex_bones(&mut self) {
+        self.bone_index.clear();
+        for (i, b) in self.bones.iter().enumerate() {
+            self.bone_index.insert(b.id.node.key(), i);
+        }
     }
 
     pub fn load_path(&mut self, scene: &mut Scene, path: &Path) -> Result<(), String> {
@@ -114,6 +285,8 @@ impl RigDocument {
         Self::relink_joint_parents(scene, &self.bones);
         // Parents changed — refresh bind from the relinked locals.
         self.capture_bind_pose(scene);
+        self.mode = AppMode::Pose;
+        self.tool = Tool::Rotate;
         self.fit_camera(scene);
         Ok(())
     }
@@ -325,7 +498,7 @@ impl RigDocument {
         let center = (min + max) * 0.5;
         let radius = ((max - min).length() * 0.5).max(0.25);
         let dist = (radius / (45f32.to_radians() * 0.5).tan()).max(1.0) * 1.35;
-        scene.camera = Camera::orbit(0.9, 0.35, dist, center);
+        scene.camera = Camera::orbit(std::f32::consts::PI, 0.35, dist, center);
         scene.camera.far = (dist + radius * 4.0).max(50.0);
         scene.camera.near = (dist * 0.001).clamp(0.01, 0.1);
     }
@@ -444,6 +617,8 @@ pub fn empty_scene() -> Scene {
     let mut scene = Scene::new();
     scene.ambient = [0.04, 0.04, 0.05];
     scene.clear_color = [0.0, 0.0, 0.0, 1.0];
+    // Z+ = forward: start on −Z looking toward origin / +Z.
+    scene.camera = Camera::orbit(std::f32::consts::PI, 0.35, 5.0, Vec3::new(0.0, 0.5, 0.0));
     if let Some(Light::Directional(d)) = scene.lights.first_mut() {
         *d = DirectionalLight {
             direction: Vec3::new(0.35, -0.55, 0.75).normalize(),

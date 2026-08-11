@@ -5,18 +5,20 @@ use mega_render::{GizmoAxis, Scene, Visualizer, WgpuVisualizer};
 use mega_ui::{DockNode, DockState, ScrollAxes, TextStyle, Ui};
 
 use crate::framework::{Demo, UiCtx, SCENE_TEX};
-use crate::gizmo::{self, RotateDrag};
+use crate::gizmo::{self, RotateDrag, TranslateDrag};
 use crate::pick;
-use crate::rig::{empty_scene, BoneId, RigDocument, Tool};
+use crate::rig::{empty_scene, AppMode, BoneId, RigDocument, Tool};
 
 pub struct AppState {
     pub scene: Scene,
     pub rig: RigDocument,
     pub status: String,
     pub rotate_drag: Option<RotateDrag>,
+    pub translate_drag: Option<TranslateDrag>,
     pub gizmo_hover: Option<GizmoAxis>,
     /// Euler degrees shown in inspector (synced from selection).
     pub edit_euler_deg: Vec3,
+    pub edit_translation: Vec3,
     pub edit_bone: Option<BoneId>,
     /// Host should re-read orbit cam from `scene.camera`.
     pub resync_camera: bool,
@@ -27,13 +29,24 @@ impl AppState {
         Self {
             scene: empty_scene(),
             rig: RigDocument::default(),
-            status: "Open a glTF / GLB · RMB orbit · MMB pan · wheel zoom".into(),
+            status: "File → New Skeleton · Tab switches Edit/Pose".into(),
             rotate_drag: None,
+            translate_drag: None,
             gizmo_hover: None,
             edit_euler_deg: Vec3::ZERO,
+            edit_translation: Vec3::ZERO,
             edit_bone: None,
             resync_camera: false,
         }
+    }
+
+    pub fn has_drag(&self) -> bool {
+        self.rotate_drag.is_some() || self.translate_drag.is_some()
+    }
+
+    pub fn clear_drags(&mut self) {
+        self.rotate_drag = None;
+        self.translate_drag = None;
     }
 
     pub fn open_dialog(&mut self) {
@@ -47,13 +60,13 @@ impl AppState {
             Ok(()) => {
                 // Pose editor: strip clips so nothing overwrites FK.
                 self.scene.animators.clear();
-                self.rotate_drag = None;
+                self.clear_drags();
                 self.gizmo_hover = None;
                 self.edit_bone = None;
                 self.resync_camera = true;
                 let with_parent = self.rig.bones.iter().filter(|b| b.parent.is_some()).count();
                 self.status = format!(
-                    "Loaded {} · {} bones ({} with parent)",
+                    "Loaded {} · {} bones ({} with parent) · Pose mode",
                     path.file_name()
                         .and_then(|s| s.to_str())
                         .unwrap_or("model"),
@@ -67,6 +80,25 @@ impl AppState {
         }
     }
 
+    pub fn new_skeleton(&mut self) {
+        self.rig.new_skeleton(&mut self.scene);
+        self.clear_drags();
+        self.gizmo_hover = None;
+        self.edit_bone = None;
+        self.resync_camera = true;
+        self.status = "New skeleton · Edit mode · Extrude (E) / Add / Translate".into();
+    }
+
+    pub fn set_mode(&mut self, mode: AppMode) {
+        self.rig.set_mode(&mut self.scene, mode);
+        self.clear_drags();
+        self.edit_bone = None;
+        self.status = match mode {
+            AppMode::Edit => "Edit mode — rest pose / hierarchy".into(),
+            AppMode::Pose => "Pose mode — FK rotate".into(),
+        };
+    }
+
     pub fn sync_inspector_from_selection(&mut self) {
         let sel = self.rig.selection;
         if self.edit_bone != sel {
@@ -76,6 +108,7 @@ impl AppState {
                     let (y, x, z) = n.local.rotation.to_euler(glam::EulerRot::YXZ);
                     self.edit_euler_deg =
                         Vec3::new(x.to_degrees(), y.to_degrees(), z.to_degrees());
+                    self.edit_translation = n.local.translation;
                 }
             }
         }
@@ -95,6 +128,21 @@ impl AppState {
         if let Some(n) = self.scene.nodes.get_mut(id.node) {
             n.local.rotation = q;
         }
+        if self.rig.mode == AppMode::Edit {
+            self.rig.write_bind_for(&self.scene, id);
+        }
+    }
+
+    pub fn apply_inspector_translation(&mut self) {
+        let Some(id) = self.edit_bone else {
+            return;
+        };
+        if let Some(n) = self.scene.nodes.get_mut(id.node) {
+            n.local.translation = self.edit_translation;
+        }
+        if self.rig.mode == AppMode::Edit {
+            self.rig.write_bind_for(&self.scene, id);
+        }
     }
 
     pub fn gizmo_radius(&self) -> f32 {
@@ -102,6 +150,15 @@ impl AppState {
             return 0.15;
         };
         gizmo::gizmo_radius(&self.scene, sel, self.rig.viewport_rect.height())
+    }
+
+    fn sync_inspector_live(&mut self, bone: BoneId) {
+        if let Some(n) = self.scene.nodes.get(bone.node) {
+            let (y, x, z) = n.local.rotation.to_euler(glam::EulerRot::YXZ);
+            self.edit_euler_deg = Vec3::new(x.to_degrees(), y.to_degrees(), z.to_degrees());
+            self.edit_translation = n.local.translation;
+            self.edit_bone = Some(bone);
+        }
     }
 }
 
@@ -118,20 +175,34 @@ pub fn handle_tools(state: &mut AppState, pointer: &PointerFrame, ui_wants_mouse
     let over = rect.width() > 1.0 && rect.height() > 1.0 && rect.contains(pointer.pos);
 
     if pointer.released {
-        state.rotate_drag = None;
-    }
-
-    // Hover gizmo rings.
-    state.gizmo_hover = None;
-    if over && state.rig.tool == Tool::Rotate {
-        if let Some(sel) = state.rig.selection {
-            let radius = state.gizmo_radius();
-            if let Some(ref drag) = state.rotate_drag {
-                state.gizmo_hover = Some(drag.axis);
-            } else {
-                state.gizmo_hover = gizmo::hover_axis(&state.scene, sel, rect, pointer.pos, radius);
+        // Commit bind on edit transforms when drag ends.
+        if state.rig.mode == AppMode::Edit {
+            if let Some(d) = state.rotate_drag {
+                state.rig.write_bind_for(&state.scene, d.bone);
+            }
+            if let Some(d) = state.translate_drag {
+                state.rig.write_bind_for(&state.scene, d.bone);
             }
         }
+        state.clear_drags();
+    }
+
+    // Hover gizmo handles.
+    state.gizmo_hover = None;
+    if over && state.rig.selection.is_some() && !state.has_drag() {
+        let sel = state.rig.selection.unwrap();
+        let radius = state.gizmo_radius();
+        state.gizmo_hover = match state.rig.tool {
+            Tool::Rotate => gizmo::hover_axis(&state.scene, sel, rect, pointer.pos, radius),
+            Tool::Translate => {
+                gizmo::hover_translate_axis(&state.scene, sel, rect, pointer.pos, radius)
+            }
+            _ => None,
+        };
+    } else if let Some(ref drag) = state.rotate_drag {
+        state.gizmo_hover = Some(drag.axis);
+    } else if let Some(ref drag) = state.translate_drag {
+        state.gizmo_hover = Some(drag.axis);
     }
 
     if state.rotate_drag.is_some() {
@@ -141,12 +212,19 @@ pub fn handle_tools(state: &mut AppState, pointer: &PointerFrame, ui_wants_mouse
                 gizmo::apply_rotate(&mut state.scene, drag, rect, pointer.pos);
                 drag.bone
             };
-            if let Some(n) = state.scene.nodes.get(bone.node) {
-                let (y, x, z) = n.local.rotation.to_euler(glam::EulerRot::YXZ);
-                state.edit_euler_deg =
-                    Vec3::new(x.to_degrees(), y.to_degrees(), z.to_degrees());
-                state.edit_bone = Some(bone);
-            }
+            state.sync_inspector_live(bone);
+        }
+        return;
+    }
+
+    if state.translate_drag.is_some() {
+        if pointer.down {
+            let bone = {
+                let drag = state.translate_drag.as_mut().unwrap();
+                gizmo::apply_translate(&mut state.scene, drag, rect, pointer.pos);
+                drag.bone
+            };
+            state.sync_inspector_live(bone);
         }
         return;
     }
@@ -155,17 +233,49 @@ pub fn handle_tools(state: &mut AppState, pointer: &PointerFrame, ui_wants_mouse
         return;
     }
 
-    // Gizmo ring first.
-    if state.rig.tool == Tool::Rotate {
-        if let Some(sel) = state.rig.selection {
-            let radius = state.gizmo_radius();
-            if let Some(drag) =
-                gizmo::begin_rotate(&state.scene, sel, rect, pointer.pos, radius)
-            {
-                state.rotate_drag = Some(drag);
+    // Gizmo grab first.
+    if let Some(sel) = state.rig.selection {
+        let radius = state.gizmo_radius();
+        match state.rig.tool {
+            Tool::Rotate => {
+                if let Some(drag) =
+                    gizmo::begin_rotate(&state.scene, sel, rect, pointer.pos, radius)
+                {
+                    state.rotate_drag = Some(drag);
+                    return;
+                }
+            }
+            Tool::Translate => {
+                if let Some(drag) =
+                    gizmo::begin_translate(&state.scene, sel, rect, pointer.pos, radius)
+                {
+                    state.translate_drag = Some(drag);
+                    return;
+                }
+            }
+            Tool::AddBone => {
+                // Click: extrude from selection, or place new root on ground.
+                if let Some(parent) = state.rig.selection {
+                    if state.rig.extrude_bone(&mut state.scene, parent).is_some() {
+                        state.edit_bone = None;
+                        state.status = "Extruded bone".into();
+                    }
+                } else if let Some(hit) = gizmo::ray_ground_hit(&state.scene, rect, pointer.pos) {
+                    state.rig.add_root_at(&mut state.scene, hit);
+                    state.edit_bone = None;
+                    state.status = "Added root bone".into();
+                }
                 return;
             }
+            Tool::Select => {}
         }
+    } else if state.rig.tool == Tool::AddBone {
+        if let Some(hit) = gizmo::ray_ground_hit(&state.scene, rect, pointer.pos) {
+            state.rig.add_root_at(&mut state.scene, hit);
+            state.edit_bone = None;
+            state.status = "Added root bone".into();
+        }
+        return;
     }
 
     // Pick bone.
@@ -222,7 +332,7 @@ impl Demo for RigApp {
     }
 
     fn update(state: &mut AppState, _dt: f32) -> bool {
-        state.rotate_drag.is_some()
+        state.has_drag()
     }
 
     fn build_ui(ui: &mut Ui, ctx: &mut UiCtx<'_>) -> bool {
@@ -233,6 +343,9 @@ impl Demo for RigApp {
 
         ui.menu_bar(|ui| {
             ui.menu("File", |ui| {
+                if ui.menu_item("New Skeleton").clicked() {
+                    ctx.state.new_skeleton();
+                }
                 if ui.menu_item_icon("folder_open", "Open…").clicked() {
                     ctx.state.open_dialog();
                 }
@@ -240,6 +353,14 @@ impl Demo for RigApp {
                     ctx.state.rig.reset_pose(&mut ctx.state.scene);
                     ctx.state.edit_bone = None;
                     ctx.state.status = "Pose reset to bind.".into();
+                }
+            });
+            ui.menu("Mode", |ui| {
+                if ui.menu_item("Edit skeleton").clicked() {
+                    ctx.state.set_mode(AppMode::Edit);
+                }
+                if ui.menu_item("Pose").clicked() {
+                    ctx.state.set_mode(AppMode::Pose);
                 }
             });
             ui.menu("View", |ui| {
@@ -267,45 +388,7 @@ impl Demo for RigApp {
 
         ui.dock_space("main", dock_size, dock, |ui, tab| match tab {
             "Viewport" => {
-                let path = state
-                    .rig
-                    .source_path
-                    .as_ref()
-                    .and_then(|p| p.file_name())
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("(no model)");
-                ui.label_styled(
-                    &format!("{path}  ·  {:?}", state.rig.tool),
-                    TextStyle {
-                        color: [0.85, 0.85, 0.85, 1.0],
-                        size: 13.0,
-                    },
-                );
-                ui.horizontal(|ui| {
-                    if ui.button("Open").clicked() {
-                        state.open_dialog();
-                    }
-                    let sel = state.rig.tool == Tool::Select;
-                    let rot = state.rig.tool == Tool::Rotate;
-                    if ui.button(if sel { "[Select]" } else { "Select" }).clicked() {
-                        state.rig.tool = Tool::Select;
-                        state.rotate_drag = None;
-                    }
-                    if ui.button(if rot { "[Rotate]" } else { "Rotate" }).clicked() {
-                        state.rig.tool = Tool::Rotate;
-                    }
-                    let skel = state.rig.show_skeleton;
-                    if ui
-                        .button(if skel { "[Bones]" } else { "Bones" })
-                        .clicked()
-                    {
-                        state.rig.show_skeleton = !skel;
-                    }
-                    if ui.button("Reset bone").clicked() {
-                        state.rig.reset_selected(&mut state.scene);
-                        state.edit_bone = None;
-                    }
-                });
+                viewport_toolbar(ui, state);
                 ui.separator();
                 let size = ui.available_size();
                 **viewport_size = size;
@@ -330,8 +413,80 @@ impl Demo for RigApp {
             },
         );
 
-        keep || state.rotate_drag.is_some()
+        keep || state.has_drag()
     }
+}
+
+fn viewport_toolbar(ui: &mut Ui, state: &mut AppState) {
+    ui.horizontal(|ui| {
+        let mut mode_i = match state.rig.mode {
+            AppMode::Edit => 0,
+            AppMode::Pose => 1,
+        };
+        if ui.toggle("app_mode", &mut mode_i, &["Edit", "Pose"]).changed() {
+            state.set_mode(if mode_i == 0 {
+                AppMode::Edit
+            } else {
+                AppMode::Pose
+            });
+        }
+
+        match state.rig.mode {
+            AppMode::Edit => {
+                let mut tool_i = match state.rig.tool {
+                    Tool::Select => 0,
+                    Tool::Translate => 1,
+                    Tool::Rotate => 2,
+                    Tool::AddBone => 3,
+                };
+                if ui
+                    .toggle("tool_edit", &mut tool_i, &["Select", "Move", "Rotate", "Add"])
+                    .changed()
+                {
+                    state.rig.tool = match tool_i {
+                        1 => Tool::Translate,
+                        2 => Tool::Rotate,
+                        3 => Tool::AddBone,
+                        _ => Tool::Select,
+                    };
+                    state.clear_drags();
+                }
+            }
+            AppMode::Pose => {
+                let mut tool_i = match state.rig.tool {
+                    Tool::Rotate => 1,
+                    _ => 0,
+                };
+                if ui
+                    .toggle("tool_pose", &mut tool_i, &["Select", "Rotate"])
+                    .changed()
+                {
+                    state.rig.tool = if tool_i == 1 {
+                        Tool::Rotate
+                    } else {
+                        Tool::Select
+                    };
+                    state.clear_drags();
+                }
+            }
+        }
+    });
+
+    let hint = match (state.rig.mode, state.rig.tool) {
+        (AppMode::Edit, Tool::AddBone) => "Click bone to extrude · empty click places root",
+        (AppMode::Edit, Tool::Translate) => "Drag arrows to move · E extrude · Del delete",
+        (AppMode::Edit, Tool::Rotate) => "Drag rings to rotate rest pose",
+        (AppMode::Edit, _) => "Select a bone · E extrude · Tab → Pose",
+        (AppMode::Pose, Tool::Rotate) => "Drag rings to pose · Reset in Inspector",
+        (AppMode::Pose, _) => "Select a bone · R rotate · Tab → Edit",
+    };
+    ui.label_styled(
+        hint,
+        TextStyle {
+            color: [0.55, 0.58, 0.62, 1.0],
+            size: 12.0,
+        },
+    );
 }
 
 fn bone_panel(ui: &mut Ui, state: &mut AppState) {
@@ -342,6 +497,30 @@ fn bone_panel(ui: &mut Ui, state: &mut AppState) {
             size: 14.0,
         },
     );
+
+    if state.rig.mode == AppMode::Edit {
+        ui.horizontal(|ui| {
+            if ui.button("Extrude").clicked() {
+                if let Some(sel) = state.rig.selection {
+                    if state.rig.extrude_bone(&mut state.scene, sel).is_some() {
+                        state.edit_bone = None;
+                        state.status = "Extruded bone".into();
+                    }
+                } else {
+                    state.status = "Select a bone to extrude".into();
+                }
+            }
+            if ui.button("Delete").clicked() {
+                if let Some(sel) = state.rig.selection {
+                    state.rig.delete_bone_subtree(&mut state.scene, sel);
+                    state.clear_drags();
+                    state.edit_bone = None;
+                    state.status = "Deleted bone subtree".into();
+                }
+            }
+        });
+    }
+
     ui.separator();
     let avail = ui.available_size();
     let roots = state.rig.roots();
@@ -349,7 +528,10 @@ fn bone_panel(ui: &mut Ui, state: &mut AppState) {
     let mut tree_sel = prev.map(bone_tree_id);
     ui.scroll_area("bones_scroll", avail, ScrollAxes::Vertical, |ui| {
         if roots.is_empty() {
-            ui.label("No bones — open a skinned glTF.");
+            ui.label("No bones yet.");
+            if ui.button("New Skeleton").clicked() {
+                state.new_skeleton();
+            }
             return;
         }
         ui.tree_scope(&mut tree_sel, |ui| {
@@ -435,6 +617,18 @@ fn inspector_panel(ui: &mut Ui, state: &mut AppState) {
         ui.label("Parent: —");
     }
     ui.separator();
+
+    if state.rig.mode == AppMode::Edit {
+        ui.label("Local translation");
+        if ui
+            .vec3("translation", &mut state.edit_translation, 0.01, Vec3::ZERO)
+            .changed()
+        {
+            state.apply_inspector_translation();
+        }
+        ui.separator();
+    }
+
     ui.label("Local rotation (YXZ °)");
     if ui
         .vec3("euler", &mut state.edit_euler_deg, 0.5, Vec3::ZERO)
@@ -442,12 +636,14 @@ fn inspector_panel(ui: &mut Ui, state: &mut AppState) {
     {
         state.apply_inspector_euler();
     }
-    if let Some(n) = state.scene.nodes.get(sel.node) {
-        let t = n.local.translation;
-        ui.label(&format!(
-            "Translation: {:.3}, {:.3}, {:.3}",
-            t.x, t.y, t.z
-        ));
+    if state.rig.mode == AppMode::Pose {
+        if let Some(n) = state.scene.nodes.get(sel.node) {
+            let t = n.local.translation;
+            ui.label(&format!(
+                "Translation: {:.3}, {:.3}, {:.3}",
+                t.x, t.y, t.z
+            ));
+        }
     }
     ui.separator();
     if ui.button("Reset bone to bind").clicked() {

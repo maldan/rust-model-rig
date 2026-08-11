@@ -3,6 +3,7 @@ mod framework;
 mod gizmo;
 mod pick;
 mod rig;
+mod view_gizmo;
 
 use app::{default_dock, RigApp};
 use framework::Host;

@@ -5,7 +5,8 @@ use std::time::{Duration, Instant};
 
 use glam::{Vec2, Vec3};
 use mega_render::{
-    Camera, DebugView, PostProcessSettings, Scene, ShadowSettings, Visualizer, WgpuVisualizer,
+    Camera, DebugView, InputFrame, PostProcessSettings, Scene, ShadowSettings, Visualizer,
+    WgpuVisualizer,
 };
 use mega_ui::wgpu::{DrawStats, UiRenderer};
 use mega_ui::{CursorIcon, DockState, Ui, UiInput};
@@ -19,6 +20,7 @@ use winit::window::{Window, WindowId};
 use crate::app::{handle_tools, AppState, PointerFrame};
 use crate::gizmo;
 use crate::rig::{draw_rig_debug, Tool};
+use crate::view_gizmo;
 
 /// Texture slot for the 3D viewport (`ui.texture(SCENE_TEX, …)`).
 pub const SCENE_TEX: u32 = 0;
@@ -69,17 +71,28 @@ struct OrbitCam {
     distance: f32,
     orbiting: bool,
     panning: bool,
+    /// Smooth snap toward (yaw, pitch).
+    snap: Option<OrbitSnap>,
+}
+
+struct OrbitSnap {
+    from_yaw: f32,
+    from_pitch: f32,
+    to_yaw: f32,
+    to_pitch: f32,
+    t: f32,
 }
 
 impl OrbitCam {
     fn from_scene(scene: &Scene) -> Self {
         let mut cam = Self {
             target: scene.camera.target,
-            yaw: 0.0,
+            yaw: std::f32::consts::PI, // sit on −Z, look along +Z (forward)
             pitch: 0.35,
             distance: 5.0,
             orbiting: false,
             panning: false,
+            snap: None,
         };
         cam.sync_from_camera(&scene.camera);
         cam
@@ -108,10 +121,11 @@ impl OrbitCam {
     }
 
     fn active(&self) -> bool {
-        self.orbiting || self.panning
+        self.orbiting || self.panning || self.snap.is_some()
     }
 
     fn add_orbit(&mut self, dx: f32, dy: f32) {
+        self.snap = None;
         const SENS: f32 = 0.005;
         self.yaw += dx * SENS;
         // DeviceEvent: +dy = mouse moved down. Drag down → look from below (pitch down).
@@ -119,6 +133,7 @@ impl OrbitCam {
     }
 
     fn add_pan(&mut self, dx: f32, dy: f32) {
+        self.snap = None;
         let eye = self.eye();
         let forward = (self.target - eye).normalize_or_zero();
         let right = Vec3::Y.cross(forward).normalize_or_zero();
@@ -131,6 +146,40 @@ impl OrbitCam {
         // scroll_y > 0 = wheel up → zoom in
         let factor = (1.0 - scroll_y * 0.0015).clamp(0.5, 1.5);
         self.distance = (self.distance * factor).clamp(0.05, 500.0);
+    }
+
+    /// Place camera on `dir` (world), looking at target. Smooth short tween.
+    fn snap_to_dir(&mut self, dir: Vec3) {
+        let d = dir.normalize_or_zero();
+        if d.length_squared() < 1e-8 {
+            return;
+        }
+        let to_pitch = d.y.clamp(-1.0, 1.0).asin().clamp(-1.55, 1.55);
+        let to_yaw = d.x.atan2(d.z);
+        self.snap = Some(OrbitSnap {
+            from_yaw: self.yaw,
+            from_pitch: self.pitch,
+            to_yaw,
+            to_pitch,
+            t: 0.0,
+        });
+    }
+
+    fn tick_snap(&mut self, dt: f32) {
+        let Some(snap) = self.snap.as_mut() else {
+            return;
+        };
+        snap.t = (snap.t + dt / 0.22).min(1.0);
+        let t = snap.t;
+        // Smoothstep.
+        let s = t * t * (3.0 - 2.0 * t);
+        self.yaw = lerp_angle(snap.from_yaw, snap.to_yaw, s);
+        self.pitch = snap.from_pitch + (snap.to_pitch - snap.from_pitch) * s;
+        if t >= 1.0 {
+            self.yaw = snap.to_yaw;
+            self.pitch = snap.to_pitch;
+            self.snap = None;
+        }
     }
 
     fn apply(&self, scene: &mut Scene) {
@@ -150,6 +199,17 @@ impl OrbitCam {
         scene.camera.near = near.clamp(0.01, near_max);
         scene.camera.far = far;
     }
+}
+
+fn lerp_angle(a: f32, b: f32, t: f32) -> f32 {
+    let mut d = b - a;
+    while d > std::f32::consts::PI {
+        d -= std::f32::consts::TAU;
+    }
+    while d < -std::f32::consts::PI {
+        d += std::f32::consts::TAU;
+    }
+    a + d * t
 }
 
 struct SceneTarget {
@@ -509,7 +569,7 @@ impl<D: Demo> Host<D> {
 
         let scroll = self.input.scroll_delta.y;
         if scroll.abs() > 0.0
-            && self.state.rotate_drag.is_none()
+            && !self.state.has_drag()
             && self.state.rig.viewport_rect.contains(self.input.mouse_pos)
         {
             self.orbit.add_zoom(scroll);
@@ -517,6 +577,7 @@ impl<D: Demo> Host<D> {
 
         self.state.scene.poll_loads();
         let demo_anim = D::update(&mut self.state, dt);
+        self.orbit.tick_snap(dt);
         self.orbit.apply(&mut self.state.scene);
         if let Some(gpu) = self.gpu.as_mut() {
             if gpu.visualizer.post_process().dof.auto_focus {
@@ -578,16 +639,32 @@ impl<D: Demo> Host<D> {
             if !self.orbit.active() {
                 let vp_rect = self.state.rig.viewport_rect;
                 let mouse = self.input.mouse_pos;
-                handle_tools(
-                    &mut self.state,
-                    &PointerFrame {
-                        pos: mouse,
-                        pressed: self.input.mouse_pressed,
-                        down: self.input.mouse_down,
-                        released: self.input.mouse_released,
-                    },
-                    out.want_capture_mouse && !vp_rect.contains(mouse),
-                );
+                let vp_size = Vec2::new(vp_rect.width().max(1.0), vp_rect.height().max(1.0));
+                let local = mouse - vp_rect.min;
+                let over_view_gizmo = vp_rect.contains(mouse)
+                    && view_gizmo::contains_cursor(vp_size, local);
+
+                let mut consumed = false;
+                if over_view_gizmo && self.input.mouse_pressed {
+                    if let Some(axis) = view_gizmo::hit_test(&self.state.scene, vp_size, local) {
+                        self.orbit.snap_to_dir(axis.dir());
+                        self.state.status = format!("View {}", axis.label_view());
+                        consumed = true;
+                    }
+                }
+
+                if !consumed {
+                    handle_tools(
+                        &mut self.state,
+                        &PointerFrame {
+                            pos: mouse,
+                            pressed: self.input.mouse_pressed && !over_view_gizmo,
+                            down: self.input.mouse_down,
+                            released: self.input.mouse_released,
+                        },
+                        out.want_capture_mouse && !vp_rect.contains(mouse),
+                    );
+                }
             }
 
             // Debug / gizmo after tools so pose matches this frame.
@@ -601,18 +678,50 @@ impl<D: Demo> Host<D> {
                 [0.32, 0.32, 0.32, 1.0],
             );
             draw_rig_debug(&mut self.state.scene, &self.state.rig);
-            if self.state.rig.tool == Tool::Rotate {
-                if let Some(sel) = self.state.rig.selection {
-                    let radius = self.state.gizmo_radius();
-                    let drag = self.state.rotate_drag.as_ref();
-                    gizmo::draw_gizmo(
-                        &mut self.state.scene,
-                        sel,
-                        radius,
-                        self.state.gizmo_hover,
-                        drag,
-                    );
+            if let Some(sel) = self.state.rig.selection {
+                let radius = self.state.gizmo_radius();
+                match self.state.rig.tool {
+                    Tool::Rotate => {
+                        gizmo::draw_rotate_gizmo(
+                            &mut self.state.scene,
+                            sel,
+                            radius,
+                            self.state.gizmo_hover,
+                            self.state.rotate_drag.as_ref(),
+                        );
+                    }
+                    Tool::Translate => {
+                        gizmo::draw_translate_gizmo(
+                            &mut self.state.scene,
+                            sel,
+                            radius,
+                            self.state.gizmo_hover,
+                            self.state.translate_drag.as_ref(),
+                        );
+                    }
+                    _ => {}
                 }
+            }
+
+            // Orientation gizmo (HUD overlay on the viewport texture).
+            {
+                let vp_rect = self.state.rig.viewport_rect;
+                let vp_size = Vec2::new(
+                    self.viewport_size.x.max(1.0),
+                    self.viewport_size.y.max(1.0),
+                );
+                let local = self.input.mouse_pos - vp_rect.min;
+                let hud_input = InputFrame {
+                    cursor: local,
+                    mouse_down: self.input.mouse_down,
+                    mouse_pressed: self.input.mouse_pressed,
+                    mouse_released: self.input.mouse_released,
+                    scroll_delta: Vec2::ZERO,
+                    dt,
+                };
+                view_gizmo::begin_hud(&mut self.state.scene, vp_size, hud_input);
+                view_gizmo::draw(&mut self.state.scene, vp_size, local);
+                view_gizmo::end_hud(&mut self.state.scene);
             }
 
             if let Some(text) = out.clipboard {
@@ -708,9 +817,7 @@ impl<D: Demo> ApplicationHandler for Host<D> {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        let playing = self.animating
-            || self.orbit.active()
-            || self.state.rotate_drag.is_some();
+        let playing = self.animating || self.orbit.active() || self.state.has_drag();
         let ms = if playing { 8 } else { 33 };
         event_loop.set_control_flow(ControlFlow::wait_duration(Duration::from_millis(ms)));
         if let Some(window) = &self.window {
@@ -728,7 +835,7 @@ impl<D: Demo> ApplicationHandler for Host<D> {
             let dx = delta.0 as f32;
             let dy = delta.1 as f32;
             let mut used = false;
-            if self.orbit.orbiting && self.state.rotate_drag.is_none() {
+            if self.orbit.orbiting && !self.state.has_drag() {
                 self.orbit.add_orbit(dx, dy);
                 used = true;
             }
@@ -777,7 +884,17 @@ impl<D: Demo> ApplicationHandler for Host<D> {
             WindowEvent::MouseInput { state, button, .. } => {
                 let down = state == ElementState::Pressed;
                 let over_vp = self.state.rig.viewport_rect.contains(self.input.mouse_pos);
-                let nav_ok = self.state.rotate_drag.is_none()
+                let vp_size = Vec2::new(
+                    self.state.rig.viewport_rect.width().max(1.0),
+                    self.state.rig.viewport_rect.height().max(1.0),
+                );
+                let over_view_gizmo = over_vp
+                    && view_gizmo::contains_cursor(
+                        vp_size,
+                        self.input.mouse_pos - self.state.rig.viewport_rect.min,
+                    );
+                let nav_ok = !self.state.has_drag()
+                    && !over_view_gizmo
                     && (!self.want_capture_mouse || over_vp);
                 match button {
                     MouseButton::Left => {
@@ -837,9 +954,9 @@ impl<D: Demo> ApplicationHandler for Host<D> {
                 let down = event.state == ElementState::Pressed;
                 if let PhysicalKey::Code(code) = event.physical_key {
                     if down && code == KeyCode::Escape {
-                        if self.state.rig.selection.is_some() || self.state.rotate_drag.is_some() {
+                        if self.state.rig.selection.is_some() || self.state.has_drag() {
                             self.state.rig.selection = None;
-                            self.state.rotate_drag = None;
+                            self.state.clear_drags();
                             self.state.edit_bone = None;
                             self.state.status = "Selection cleared.".into();
                         } else {
@@ -848,13 +965,63 @@ impl<D: Demo> ApplicationHandler for Host<D> {
                     }
                     if down && !self.want_capture_keyboard {
                         match code {
-                            KeyCode::KeyR | KeyCode::Digit2 => {
+                            KeyCode::Tab => {
+                                let next = match self.state.rig.mode {
+                                    crate::rig::AppMode::Edit => crate::rig::AppMode::Pose,
+                                    crate::rig::AppMode::Pose => crate::rig::AppMode::Edit,
+                                };
+                                self.state.set_mode(next);
+                            }
+                            KeyCode::KeyR | KeyCode::Digit3 => {
                                 self.state.rig.tool = crate::rig::Tool::Rotate;
-                                self.state.status = "Tool: Rotate (drag RGB rings)".into();
+                                self.state.clear_drags();
+                                self.state.status = "Tool: Rotate".into();
+                            }
+                            KeyCode::KeyG | KeyCode::Digit2 => {
+                                if self.state.rig.mode == crate::rig::AppMode::Edit {
+                                    self.state.rig.tool = crate::rig::Tool::Translate;
+                                    self.state.clear_drags();
+                                    self.state.status = "Tool: Move".into();
+                                }
+                            }
+                            KeyCode::KeyA => {
+                                if self.state.rig.mode == crate::rig::AppMode::Edit {
+                                    self.state.rig.tool = crate::rig::Tool::AddBone;
+                                    self.state.clear_drags();
+                                    self.state.status =
+                                        "Tool: Add — click to extrude / place root".into();
+                                }
+                            }
+                            KeyCode::KeyE => {
+                                if self.state.rig.mode == crate::rig::AppMode::Edit {
+                                    if let Some(sel) = self.state.rig.selection {
+                                        if self
+                                            .state
+                                            .rig
+                                            .extrude_bone(&mut self.state.scene, sel)
+                                            .is_some()
+                                        {
+                                            self.state.edit_bone = None;
+                                            self.state.status = "Extruded bone".into();
+                                        }
+                                    }
+                                }
+                            }
+                            KeyCode::Delete => {
+                                if self.state.rig.mode == crate::rig::AppMode::Edit {
+                                    if let Some(sel) = self.state.rig.selection {
+                                        self.state
+                                            .rig
+                                            .delete_bone_subtree(&mut self.state.scene, sel);
+                                        self.state.clear_drags();
+                                        self.state.edit_bone = None;
+                                        self.state.status = "Deleted bone subtree".into();
+                                    }
+                                }
                             }
                             KeyCode::Digit1 => {
                                 self.state.rig.tool = crate::rig::Tool::Select;
-                                self.state.rotate_drag = None;
+                                self.state.clear_drags();
                                 self.state.status = "Tool: Select".into();
                             }
                             _ => {}
