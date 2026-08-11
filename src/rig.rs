@@ -58,6 +58,26 @@ pub enum Tool {
     Rotate,
 }
 
+/// How the Move tool applies translation (Pose). Edit always uses FK.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MoveMode {
+    /// Local/world translate of selection roots (current behaviour).
+    #[default]
+    Fk,
+    /// CCD Auto-IK: short chain pull.
+    AutoIk,
+    /// Soft CCD with root falloff (whole ancestor chain).
+    Verlet,
+}
+
+/// Gizmo / transform axis space.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TransformSpace {
+    #[default]
+    Local,
+    World,
+}
+
 pub struct BoneInfo {
     pub id: BoneId,
     pub name: String,
@@ -108,6 +128,8 @@ pub struct RigDocument {
     weight_overlay: WeightOverlayCache,
     pub mode: AppMode,
     pub tool: Tool,
+    pub move_mode: MoveMode,
+    pub transform_space: TransformSpace,
     /// Screen-space rect of the 3D viewport (updated each UI frame).
     pub viewport_rect: mega_ui::Rect,
     /// Counter for default bone names.
@@ -130,6 +152,8 @@ impl Default for RigDocument {
             weight_overlay: WeightOverlayCache::default(),
             mode: AppMode::Pose,
             tool: Tool::Rotate,
+            move_mode: MoveMode::Fk,
+            transform_space: TransformSpace::Local,
             viewport_rect: mega_ui::Rect {
                 min: glam::Vec2::ZERO,
                 max: glam::Vec2::ZERO,

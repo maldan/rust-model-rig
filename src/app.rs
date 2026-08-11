@@ -6,8 +6,10 @@ use mega_ui::{DockNode, DockState, ScrollAxes, TextStyle, Ui};
 
 use crate::framework::{Demo, UiCtx, SCENE_TEX};
 use crate::gizmo::{self, RotateDrag, TranslateDrag};
+use crate::ik::{self, IkPullDrag};
 use crate::pick;
-use crate::rig::{empty_scene, AppMode, BoneId, RigDocument, Tool};
+use crate::rig::{empty_scene, AppMode, BoneId, MoveMode, RigDocument, Tool, TransformSpace};
+use crate::verlet::{self, VerletDrag};
 
 pub struct AppState {
     pub scene: Scene,
@@ -15,6 +17,8 @@ pub struct AppState {
     pub status: String,
     pub rotate_drag: Option<RotateDrag>,
     pub translate_drag: Option<TranslateDrag>,
+    pub ik_drag: Option<IkPullDrag>,
+    pub verlet_drag: Option<VerletDrag>,
     pub marquee: Option<MarqueeDrag>,
     pub gizmo_hover: Option<GizmoAxis>,
     /// Euler degrees shown in inspector (synced from selection).
@@ -40,6 +44,8 @@ impl AppState {
             status: "File → New Skeleton · Tab switches Edit/Pose".into(),
             rotate_drag: None,
             translate_drag: None,
+            ik_drag: None,
+            verlet_drag: None,
             marquee: None,
             gizmo_hover: None,
             edit_euler_deg: Vec3::ZERO,
@@ -50,12 +56,18 @@ impl AppState {
     }
 
     pub fn has_drag(&self) -> bool {
-        self.rotate_drag.is_some() || self.translate_drag.is_some() || self.marquee.is_some()
+        self.rotate_drag.is_some()
+            || self.translate_drag.is_some()
+            || self.ik_drag.is_some()
+            || self.verlet_drag.is_some()
+            || self.marquee.is_some()
     }
 
     pub fn clear_drags(&mut self) {
         self.rotate_drag = None;
         self.translate_drag = None;
+        self.ik_drag = None;
+        self.verlet_drag = None;
         self.marquee = None;
     }
 
@@ -245,12 +257,21 @@ pub fn handle_tools(state: &mut AppState, pointer: &PointerFrame, ui_wants_mouse
             let radius = state.gizmo_radius();
             state.gizmo_hover = match state.rig.tool {
                 Tool::Rotate => {
-                    gizmo::hover_axis(&state.scene, sel, pivot, rect, pointer.pos, radius)
+                    gizmo::hover_axis(
+                        &state.scene,
+                        sel,
+                        pivot,
+                        state.rig.transform_space,
+                        rect,
+                        pointer.pos,
+                        radius,
+                    )
                 }
                 Tool::Translate => gizmo::hover_translate_axis(
                     &state.scene,
                     sel,
                     pivot,
+                    state.rig.transform_space,
                     rect,
                     pointer.pos,
                     radius,
@@ -261,6 +282,10 @@ pub fn handle_tools(state: &mut AppState, pointer: &PointerFrame, ui_wants_mouse
     } else if let Some(ref drag) = state.rotate_drag {
         state.gizmo_hover = Some(drag.axis);
     } else if let Some(ref drag) = state.translate_drag {
+        state.gizmo_hover = Some(drag.axis);
+    } else if let Some(ref drag) = state.ik_drag {
+        state.gizmo_hover = Some(drag.axis);
+    } else if let Some(ref drag) = state.verlet_drag {
         state.gizmo_hover = Some(drag.axis);
     }
 
@@ -290,6 +315,32 @@ pub fn handle_tools(state: &mut AppState, pointer: &PointerFrame, ui_wants_mouse
         return;
     }
 
+    if state.ik_drag.is_some() {
+        if pointer.down {
+            let bone = {
+                let drag = state.ik_drag.as_ref().unwrap();
+                ik::apply_ik_pull(&mut state.scene, drag, rect, pointer.pos);
+                drag.bone
+            };
+            state.rig.invalidate_weight_overlay();
+            state.sync_inspector_live(bone);
+        }
+        return;
+    }
+
+    if state.verlet_drag.is_some() {
+        if pointer.down {
+            let bone = {
+                let drag = state.verlet_drag.as_ref().unwrap();
+                verlet::apply_verlet_pull(&mut state.scene, drag, rect, pointer.pos);
+                drag.bone
+            };
+            state.rig.invalidate_weight_overlay();
+            state.sync_inspector_live(bone);
+        }
+        return;
+    }
+
     if ui_wants_mouse || !over || !pointer.pressed {
         return;
     }
@@ -306,6 +357,7 @@ pub fn handle_tools(state: &mut AppState, pointer: &PointerFrame, ui_wants_mouse
                     sel,
                     &roots,
                     pivot,
+                    state.rig.transform_space,
                     rect,
                     pointer.pos,
                     radius,
@@ -315,11 +367,45 @@ pub fn handle_tools(state: &mut AppState, pointer: &PointerFrame, ui_wants_mouse
                 }
             }
             Tool::Translate => {
+                let pose_move = state.rig.mode == AppMode::Pose;
+                let space = state.rig.transform_space;
+                if pose_move && state.rig.move_mode == MoveMode::AutoIk {
+                    if let Some(drag) = ik::begin_ik_pull(
+                        &state.scene,
+                        &state.rig,
+                        sel,
+                        pivot,
+                        space,
+                        rect,
+                        pointer.pos,
+                        radius,
+                    ) {
+                        state.ik_drag = Some(drag);
+                        return;
+                    }
+                }
+                if pose_move && state.rig.move_mode == MoveMode::Verlet {
+                    if let Some(drag) = verlet::begin_verlet_pull(
+                        &state.scene,
+                        &state.rig,
+                        sel,
+                        pivot,
+                        space,
+                        rect,
+                        pointer.pos,
+                        radius,
+                    ) {
+                        state.verlet_drag = Some(drag);
+                        return;
+                    }
+                }
+                // FK (default), or soft-mode fallback when chain too short.
                 if let Some(drag) = gizmo::begin_translate(
                     &state.scene,
                     sel,
                     &roots,
                     pivot,
+                    space,
                     rect,
                     pointer.pos,
                     radius,
@@ -599,26 +685,49 @@ fn viewport_toolbar(ui: &mut Ui, state: &mut AppState) {
                     };
                     state.clear_drags();
                 }
+                if state.rig.tool == Tool::Translate {
+                    let mut move_i = match state.rig.move_mode {
+                        MoveMode::Fk => 0,
+                        MoveMode::AutoIk => 1,
+                        MoveMode::Verlet => 2,
+                    };
+                    if ui
+                        .toggle("move_mode", &mut move_i, &["FK", "IK", "Soft"])
+                        .changed()
+                    {
+                        state.rig.move_mode = match move_i {
+                            1 => MoveMode::AutoIk,
+                            2 => MoveMode::Verlet,
+                            _ => MoveMode::Fk,
+                        };
+                        state.clear_drags();
+                        state.status = match state.rig.move_mode {
+                            MoveMode::Fk => "Move · FK".into(),
+                            MoveMode::AutoIk => "Move · IK (CCD, short chain)".into(),
+                            MoveMode::Verlet => "Move · Soft (CCD + falloff)".into(),
+                        };
+                    }
+                }
+            }
+        }
+
+        if matches!(state.rig.tool, Tool::Translate | Tool::Rotate) {
+            let mut space_i = match state.rig.transform_space {
+                TransformSpace::Local => 0,
+                TransformSpace::World => 1,
+            };
+            if ui
+                .toggle("xform_space", &mut space_i, &["Local", "World"])
+                .changed()
+            {
+                state.rig.transform_space = match space_i {
+                    1 => TransformSpace::World,
+                    _ => TransformSpace::Local,
+                };
+                state.clear_drags();
             }
         }
     });
-
-    let hint = match (state.rig.mode, state.rig.tool) {
-        (AppMode::Edit, Tool::AddBone) => "Click bone to extrude · empty click places root",
-        (AppMode::Edit, Tool::Translate) => "Drag arrows · Ctrl+drag box select · E extrude",
-        (AppMode::Edit, Tool::Rotate) => "Drag rings · Ctrl+drag box select",
-        (AppMode::Edit, _) => "Select · Ctrl+drag box · Ctrl+click toggle · Tab → Pose",
-        (AppMode::Pose, Tool::Translate) => "Drag arrows · Ctrl+drag box select",
-        (AppMode::Pose, Tool::Rotate) => "Drag rings · Ctrl+drag box select",
-        (AppMode::Pose, _) => "Select · Ctrl+drag box · Ctrl+click toggle · Tab → Edit",
-    };
-    ui.label_styled(
-        hint,
-        TextStyle {
-            color: [0.55, 0.58, 0.62, 1.0],
-            size: 12.0,
-        },
-    );
 }
 
 fn bone_panel(ui: &mut Ui, state: &mut AppState) {

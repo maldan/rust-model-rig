@@ -712,6 +712,7 @@ impl<D: Demo> Host<D> {
                             sel,
                             pivot,
                             radius,
+                            self.state.rig.transform_space,
                             self.state.gizmo_hover,
                             self.state.rotate_drag.as_ref(),
                         );
@@ -722,6 +723,7 @@ impl<D: Demo> Host<D> {
                             sel,
                             pivot,
                             radius,
+                            self.state.rig.transform_space,
                             self.state.gizmo_hover,
                             self.state.translate_drag.as_ref(),
                         );

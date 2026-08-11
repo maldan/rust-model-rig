@@ -9,7 +9,7 @@ use mega_render::{
 use mega_ui::Rect;
 
 use crate::pick::{project_world_to_screen, ray_from_viewport, Ray};
-use crate::rig::BoneId;
+use crate::rig::{BoneId, TransformSpace};
 
 #[derive(Clone)]
 pub struct RotateDrag {
@@ -64,6 +64,16 @@ pub fn bone_world_basis(scene: &Scene, bone: BoneId) -> Option<(Vec3, Mat3)> {
     Some((origin, Mat3::from_cols(x, y, z)))
 }
 
+pub fn gizmo_basis(scene: &Scene, bone: BoneId, space: TransformSpace) -> Option<(Vec3, Mat3)> {
+    match space {
+        TransformSpace::Local => bone_world_basis(scene, bone),
+        TransformSpace::World => {
+            let origin = scene.world_matrix(bone.node).transform_point3(Vec3::ZERO);
+            Some((origin, Mat3::IDENTITY))
+        }
+    }
+}
+
 fn world_axis_of(basis: Mat3, axis: GizmoAxis) -> Vec3 {
     match axis {
         GizmoAxis::X => basis.x_axis,
@@ -82,10 +92,11 @@ pub fn draw_rotate_gizmo(
     bone: BoneId,
     pivot: Vec3,
     radius: f32,
+    space: TransformSpace,
     hover: Option<GizmoAxis>,
     drag: Option<&RotateDrag>,
 ) {
-    let Some((_, basis)) = bone_world_basis(scene, bone) else {
+    let Some((_, basis)) = gizmo_basis(scene, bone, space) else {
         return;
     };
     let origin = drag.map(|d| d.origin).unwrap_or(pivot);
@@ -118,10 +129,11 @@ pub fn draw_translate_gizmo(
     bone: BoneId,
     pivot: Vec3,
     radius: f32,
+    space: TransformSpace,
     hover: Option<GizmoAxis>,
     drag: Option<&TranslateDrag>,
 ) {
-    let Some((_, basis)) = bone_world_basis(scene, bone) else {
+    let Some((_, basis)) = gizmo_basis(scene, bone, space) else {
         return;
     };
     let origin = drag.map(|d| d.origin).unwrap_or(pivot);
@@ -145,12 +157,13 @@ pub fn pick_rotate_axis(
     scene: &Scene,
     bone: BoneId,
     origin: Vec3,
+    space: TransformSpace,
     viewport: Rect,
     cursor: Vec2,
     radius: f32,
 ) -> Option<(GizmoAxis, f32, Vec3, Vec3)> {
     let ray = ray_from_viewport(scene, viewport, cursor)?;
-    let (_, basis) = bone_world_basis(scene, bone)?;
+    let (_, basis) = gizmo_basis(scene, bone, space)?;
 
     let mut best: Option<(f32, GizmoAxis, f32, Vec3, Vec3)> = None;
     for axis in rotate_axes() {
@@ -256,12 +269,13 @@ pub fn pick_translate_axis(
     scene: &Scene,
     bone: BoneId,
     origin: Vec3,
+    space: TransformSpace,
     viewport: Rect,
     cursor: Vec2,
     radius: f32,
 ) -> Option<GizmoAxis> {
     let ray = ray_from_viewport(scene, viewport, cursor)?;
-    let (_, basis) = bone_world_basis(scene, bone)?;
+    let (_, basis) = gizmo_basis(scene, bone, space)?;
     let x = basis.x_axis;
     let y = basis.y_axis;
     let z = basis.z_axis;
@@ -297,12 +311,14 @@ pub fn begin_rotate(
     bone: BoneId,
     roots: &[BoneId],
     pivot: Vec3,
+    space: TransformSpace,
     viewport: Rect,
     cursor: Vec2,
     radius: f32,
 ) -> Option<RotateDrag> {
-    let (axis, angle, u, v) = pick_rotate_axis(scene, bone, pivot, viewport, cursor, radius)?;
-    let (_, basis) = bone_world_basis(scene, bone)?;
+    let (axis, angle, u, v) =
+        pick_rotate_axis(scene, bone, pivot, space, viewport, cursor, radius)?;
+    let (_, basis) = gizmo_basis(scene, bone, space)?;
     let mut bones = Vec::new();
     let ids = if roots.is_empty() {
         std::slice::from_ref(&bone)
@@ -341,12 +357,13 @@ pub fn begin_translate(
     bone: BoneId,
     roots: &[BoneId],
     pivot: Vec3,
+    space: TransformSpace,
     viewport: Rect,
     cursor: Vec2,
     radius: f32,
 ) -> Option<TranslateDrag> {
-    let axis = pick_translate_axis(scene, bone, pivot, viewport, cursor, radius)?;
-    let (_, basis) = bone_world_basis(scene, bone)?;
+    let axis = pick_translate_axis(scene, bone, pivot, space, viewport, cursor, radius)?;
+    let (_, basis) = gizmo_basis(scene, bone, space)?;
     let x = basis.x_axis;
     let y = basis.y_axis;
     let z = basis.z_axis;
@@ -408,22 +425,24 @@ pub fn hover_axis(
     scene: &Scene,
     bone: BoneId,
     origin: Vec3,
+    space: TransformSpace,
     viewport: Rect,
     cursor: Vec2,
     radius: f32,
 ) -> Option<GizmoAxis> {
-    pick_rotate_axis(scene, bone, origin, viewport, cursor, radius).map(|(a, ..)| a)
+    pick_rotate_axis(scene, bone, origin, space, viewport, cursor, radius).map(|(a, ..)| a)
 }
 
 pub fn hover_translate_axis(
     scene: &Scene,
     bone: BoneId,
     origin: Vec3,
+    space: TransformSpace,
     viewport: Rect,
     cursor: Vec2,
     radius: f32,
 ) -> Option<GizmoAxis> {
-    pick_translate_axis(scene, bone, origin, viewport, cursor, radius)
+    pick_translate_axis(scene, bone, origin, space, viewport, cursor, radius)
 }
 
 /// Rotate selection roots around shared pivot (children follow via FK).

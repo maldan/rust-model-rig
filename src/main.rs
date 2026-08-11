@@ -1,8 +1,10 @@
 mod app;
 mod framework;
 mod gizmo;
+mod ik;
 mod pick;
 mod rig;
+mod verlet;
 
 use app::{default_dock, RigApp};
 use framework::Host;
