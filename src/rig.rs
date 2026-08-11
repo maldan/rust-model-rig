@@ -87,6 +87,32 @@ pub struct BoneInfo {
     pub deform: bool,
 }
 
+/// Configured IK: deform chain + control target/pole bones.
+#[derive(Clone, Debug)]
+pub struct IkChain {
+    pub id: u32,
+    pub name: String,
+    /// Effector (hand / foot / chain end) — position we reach for.
+    pub tip: BoneId,
+    /// Bones that rotate, root-first (any length ≥ 1).
+    pub bones: Vec<BoneId>,
+    /// Control bone (`deform: false`) — drag this in Pose.
+    pub target: BoneId,
+    /// Control bone — bend / pole preference.
+    pub pole: BoneId,
+    pub enabled: bool,
+    /// Segment lengths bones[i]→bones[i+1], last → tip (for 2-bone analytic).
+    pub lengths: Vec<f32>,
+    /// `tip_world_rot = target_world_rot * tip_rot_offset` (set at Create IK).
+    pub tip_rot_offset: glam::Quat,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IkControlKind {
+    Target,
+    Pole,
+}
+
 #[derive(Clone)]
 struct WeightOverlayCache {
     dirty: bool,
@@ -130,10 +156,13 @@ pub struct RigDocument {
     pub tool: Tool,
     pub move_mode: MoveMode,
     pub transform_space: TransformSpace,
+    /// Configured IK limbs (arms / legs).
+    pub ik_chains: Vec<IkChain>,
     /// Screen-space rect of the 3D viewport (updated each UI frame).
     pub viewport_rect: mega_ui::Rect,
     /// Counter for default bone names.
     next_bone_serial: u32,
+    next_ik_serial: u32,
 }
 
 impl Default for RigDocument {
@@ -154,11 +183,13 @@ impl Default for RigDocument {
             tool: Tool::Rotate,
             move_mode: MoveMode::Fk,
             transform_space: TransformSpace::Local,
+            ik_chains: Vec::new(),
             viewport_rect: mega_ui::Rect {
                 min: glam::Vec2::ZERO,
                 max: glam::Vec2::ZERO,
             },
             next_bone_serial: 1,
+            next_ik_serial: 1,
         }
     }
 }
@@ -267,19 +298,22 @@ impl RigDocument {
         self.bone_index.clear();
         self.clear_selection();
         self.bind_locals.clear();
+        self.ik_chains.clear();
         self.next_bone_serial = 1;
+        self.next_ik_serial = 1;
         self.weight_overlay.clear();
     }
 
     /// Empty scene + root bone (+ tip child so a segment is visible).
     pub fn new_skeleton(&mut self, scene: &mut Scene) {
         self.clear_model(scene);
-        let root = self.insert_bone(scene, "Root", None, Transform::default());
+        let root = self.insert_bone(scene, "Root", None, Transform::default(), true);
         let tip = self.insert_bone(
             scene,
             "Bone",
             Some(root),
             Transform::from_translation(Vec3::Y * 0.35),
+            true,
         );
         self.set_selection(tip);
         self.capture_bind_pose(scene);
@@ -327,6 +361,7 @@ impl RigDocument {
             &name,
             Some(parent),
             Transform::from_translation(Vec3::Y * len),
+            true,
         );
         self.set_selection(id);
         self.write_bind_for(scene, id);
@@ -342,6 +377,7 @@ impl RigDocument {
             &name,
             None,
             Transform::from_translation(world_pos),
+            true,
         );
         self.set_selection(id);
         self.write_bind_for(scene, id);
@@ -362,7 +398,27 @@ impl RigDocument {
             kill.push(cur);
         }
 
-        let kill_set: HashSet<(u32, u32)> = kill.iter().map(|b| b.node.key()).collect();
+        let mut kill_set: HashSet<(u32, u32)> = kill.iter().map(|b| b.node.key()).collect();
+
+        // Remove IK entries; include their control bones in the delete set.
+        let mut keep_chains = Vec::new();
+        for c in self.ik_chains.drain(..) {
+            let hit = kill_set.contains(&c.tip.node.key())
+                || kill_set.contains(&c.target.node.key())
+                || kill_set.contains(&c.pole.node.key())
+                || c.bones.iter().any(|b| kill_set.contains(&b.node.key()));
+            if hit {
+                if kill_set.insert(c.target.node.key()) {
+                    kill.push(c.target);
+                }
+                if kill_set.insert(c.pole.node.key()) {
+                    kill.push(c.pole);
+                }
+            } else {
+                keep_chains.push(c);
+            }
+        }
+        self.ik_chains = keep_chains;
 
         // Detach from surviving parents' children lists.
         for b in &mut self.bones {
@@ -388,12 +444,205 @@ impl RigDocument {
         self.reindex_bones();
     }
 
+    /// Role of a bone if it is an IK control handle.
+    pub fn ik_control_kind(&self, id: BoneId) -> Option<IkControlKind> {
+        for c in &self.ik_chains {
+            if c.target == id {
+                return Some(IkControlKind::Target);
+            }
+            if c.pole == id {
+                return Some(IkControlKind::Pole);
+            }
+        }
+        None
+    }
+
+    pub fn ik_chain_for_tip(&self, tip: BoneId) -> Option<&IkChain> {
+        self.ik_chains.iter().find(|c| c.tip == tip)
+    }
+
+    /// Create IK from tip. `rotate_count` = how many ancestors of tip rotate (1..=32).
+    /// Tip itself is the effector (not counted in rotate_count).
+    pub fn create_ik_from_tip(
+        &mut self,
+        scene: &mut Scene,
+        tip: BoneId,
+        rotate_count: usize,
+    ) -> Result<u32, &'static str> {
+        if self.ik_chains.iter().any(|c| c.tip == tip) {
+            return Err("IK already exists on this tip");
+        }
+        if self.ik_control_kind(tip).is_some() {
+            return Err("Cannot create IK on a control bone");
+        }
+        let rotate_count = rotate_count.clamp(1, 32);
+        let mut bones_rev = Vec::new();
+        let mut cur = self.bone(tip).and_then(|b| b.parent);
+        while let Some(id) = cur {
+            bones_rev.push(id);
+            if bones_rev.len() >= rotate_count {
+                break;
+            }
+            cur = self.bone(id).and_then(|b| b.parent);
+        }
+        if bones_rev.is_empty() {
+            return Err("Tip needs at least one parent bone");
+        }
+        if bones_rev.len() < rotate_count {
+            return Err("Not enough ancestors for this chain length");
+        }
+        bones_rev.reverse();
+        let bones = bones_rev;
+
+        let tip_pos = scene.world_matrix(tip.node).transform_point3(Vec3::ZERO);
+        let mut lengths = Vec::with_capacity(bones.len());
+        for i in 0..bones.len() {
+            let a = scene
+                .world_matrix(bones[i].node)
+                .transform_point3(Vec3::ZERO);
+            let b = if i + 1 < bones.len() {
+                scene
+                    .world_matrix(bones[i + 1].node)
+                    .transform_point3(Vec3::ZERO)
+            } else {
+                tip_pos
+            };
+            lengths.push((b - a).length().max(1e-3));
+        }
+
+        let mid_id = bones[bones.len() / 2];
+        let root_pos = scene
+            .world_matrix(bones[0].node)
+            .transform_point3(Vec3::ZERO);
+        let mid_pos = scene.world_matrix(mid_id.node).transform_point3(Vec3::ZERO);
+        let avg = (lengths.iter().sum::<f32>() / lengths.len() as f32).max(0.08);
+
+        let axis = (tip_pos - root_pos).normalize_or_zero();
+        let mut bend = mid_pos - root_pos - axis * (mid_pos - root_pos).dot(axis);
+        if bend.length_squared() < 1e-8 {
+            let mut s = axis.cross(Vec3::Y);
+            if s.length_squared() < 1e-8 {
+                s = axis.cross(Vec3::X);
+            }
+            bend = s;
+        }
+        let pole_pos = mid_pos + bend.normalize() * avg * 1.15;
+
+        let tip_name = self
+            .bone(tip)
+            .map(|b| b.name.clone())
+            .unwrap_or_else(|| "IK".into());
+        let n = bones.len();
+        let chain_name = format!("IK_{tip_name}×{n}");
+        let target_name = format!("{tip_name}.IK");
+        let pole_name = format!("{tip_name}.Pole");
+
+        // Target inherits tip world rotation so Rotate on target drives the hand.
+        let tip_world_rot = {
+            let m = scene.world_matrix(tip.node);
+            let (_, r, _) = m.to_scale_rotation_translation();
+            r.normalize()
+        };
+        let target = self.insert_control_bone(scene, &target_name, tip_pos, tip_world_rot);
+        let pole = self.insert_control_bone(scene, &pole_name, pole_pos, glam::Quat::IDENTITY);
+
+        let id = self.next_ik_serial;
+        self.next_ik_serial += 1;
+        self.ik_chains.push(IkChain {
+            id,
+            name: chain_name,
+            tip,
+            bones,
+            target,
+            pole,
+            enabled: true,
+            lengths,
+            // Matched at create → identity offset.
+            tip_rot_offset: glam::Quat::IDENTITY,
+        });
+        self.set_selection(target);
+        self.write_bind_for(scene, target);
+        self.write_bind_for(scene, pole);
+        Ok(id)
+    }
+
+    pub fn remove_ik_chain(&mut self, scene: &mut Scene, chain_id: u32) {
+        let Some(idx) = self.ik_chains.iter().position(|c| c.id == chain_id) else {
+            return;
+        };
+        let chain = self.ik_chains.remove(idx);
+        self.delete_single_bone(scene, chain.target);
+        self.delete_single_bone(scene, chain.pole);
+    }
+
+    pub fn set_ik_enabled(&mut self, chain_id: u32, enabled: bool) {
+        if let Some(c) = self.ik_chains.iter_mut().find(|c| c.id == chain_id) {
+            c.enabled = enabled;
+        }
+    }
+
+    fn insert_control_bone(
+        &mut self,
+        scene: &mut Scene,
+        name: &str,
+        world_pos: Vec3,
+        world_rot: glam::Quat,
+    ) -> BoneId {
+        self.insert_bone(
+            scene,
+            name,
+            None,
+            Transform {
+                translation: world_pos,
+                rotation: world_rot.normalize(),
+                scale: Vec3::ONE,
+            },
+            false,
+        )
+    }
+
+    /// Delete one bone (no descendants). Used for IK controls.
+    fn delete_single_bone(&mut self, scene: &mut Scene, id: BoneId) {
+        if self.bone(id).is_none() {
+            return;
+        }
+        let key = id.node.key();
+        if let Some(parent) = self.bone(id).and_then(|b| b.parent) {
+            if let Some(&pi) = self.bone_index.get(&parent.node.key()) {
+                self.bones[pi].children.retain(|c| c.node.key() != key);
+            }
+        }
+        let children: Vec<BoneId> = self
+            .bone(id)
+            .map(|b| b.children.clone())
+            .unwrap_or_default();
+        for child in children {
+            if let Some(&ci) = self.bone_index.get(&child.node.key()) {
+                self.bones[ci].parent = None;
+            }
+            if let Some(n) = scene.nodes.get_mut(child.node) {
+                n.parent = None;
+            }
+        }
+
+        self.selected.remove(&id);
+        if self.selection == Some(id) {
+            self.selection = self.selected.iter().copied().next();
+        }
+        self.bind_locals.remove(&key);
+        self.bone_index.remove(&key);
+        scene.nodes.remove(id.node);
+        self.bones.retain(|b| b.id.node.key() != key);
+        self.reindex_bones();
+    }
+
     fn insert_bone(
         &mut self,
         scene: &mut Scene,
         name: &str,
         parent: Option<BoneId>,
         local: Transform,
+        deform: bool,
     ) -> BoneId {
         let node = scene.nodes.insert(Node {
             name: name.to_string(),
@@ -412,7 +661,7 @@ impl RigDocument {
             name: name.to_string(),
             parent,
             children: Vec::new(),
-            deform: false,
+            deform,
         });
         if let Some(p) = parent {
             if let Some(&pi) = self.bone_index.get(&p.node.key()) {
@@ -690,6 +939,10 @@ impl RigDocument {
         };
 
         for b in &self.bones {
+            // IK controls: joint markers only (no stick stub).
+            if self.ik_control_kind(b.id).is_some() {
+                continue;
+            }
             let from = scene.world_matrix(b.id.node).transform_point3(Vec3::ZERO);
             if b.children.is_empty() {
                 let m = scene.world_matrix(b.id.node);
@@ -699,6 +952,9 @@ impl RigDocument {
                 }
             } else {
                 for &child in &b.children {
+                    if self.ik_control_kind(child).is_some() {
+                        continue;
+                    }
                     let to = scene.world_matrix(child.node).transform_point3(Vec3::ZERO);
                     if (to - from).length_squared() > 1e-10 {
                         out.push((from, to, b.id));
@@ -730,6 +986,10 @@ const BONE_OUTLINE: [f32; 4] = [0.02, 0.02, 0.04, 1.0];
 /// Selected: bright fill + darker blue outline (both blue so selection pops).
 const BONE_SEL_FILL: [f32; 4] = [0.35, 0.72, 1.0, 1.0];
 const BONE_SEL_OUTLINE: [f32; 4] = [0.06, 0.22, 0.55, 1.0];
+const IK_TARGET_FILL: [f32; 4] = [1.0, 0.55, 0.12, 1.0];
+const IK_TARGET_OUTLINE: [f32; 4] = [0.45, 0.18, 0.02, 1.0];
+const IK_POLE_FILL: [f32; 4] = [0.85, 0.35, 0.95, 1.0];
+const IK_POLE_OUTLINE: [f32; 4] = [0.35, 0.08, 0.45, 1.0];
 
 /// Blender-ish weight ramp: blue → cyan → green → yellow → red.
 fn weight_heat(w: f32) -> [f32; 4] {
@@ -983,15 +1243,23 @@ pub fn draw_rig_debug(scene: &mut Scene, rig: &RigDocument) {
     for b in &rig.bones {
         let pos = scene.world_matrix(b.id.node).transform_point3(Vec3::ZERO);
         let selected = rig.is_selected(b.id);
-        let (outline, fill) = if selected {
-            (BONE_SEL_OUTLINE, BONE_SEL_FILL)
-        } else {
-            (BONE_OUTLINE, BONE_FILL)
+        let (outline, fill, joint, joint_out) = match (rig.ik_control_kind(b.id), selected) {
+            (Some(IkControlKind::Target), false) => {
+                (IK_TARGET_OUTLINE, IK_TARGET_FILL, BONE_JOINT * 1.35, BONE_JOINT_OUTLINE * 1.35)
+            }
+            (Some(IkControlKind::Pole), false) => {
+                (IK_POLE_OUTLINE, IK_POLE_FILL, BONE_JOINT * 1.2, BONE_JOINT_OUTLINE * 1.2)
+            }
+            (Some(IkControlKind::Target), true) | (Some(IkControlKind::Pole), true) => {
+                (BONE_SEL_OUTLINE, BONE_SEL_FILL, BONE_JOINT * 1.4, BONE_JOINT_OUTLINE * 1.4)
+            }
+            (None, true) => (BONE_SEL_OUTLINE, BONE_SEL_FILL, BONE_JOINT, BONE_JOINT_OUTLINE),
+            (None, false) => (BONE_OUTLINE, BONE_FILL, BONE_JOINT, BONE_JOINT_OUTLINE),
         };
         scene
             .debug
-            .point_ex(pos, outline, BONE_JOINT_OUTLINE, false);
-        scene.debug.point_ex(pos, fill, BONE_JOINT, false);
+            .point_ex(pos, outline, joint_out, false);
+        scene.debug.point_ex(pos, fill, joint, false);
     }
 }
 

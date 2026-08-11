@@ -19,6 +19,7 @@ use winit::window::{Window, WindowId};
 
 use crate::app::{handle_tools, AppState, PointerFrame};
 use crate::gizmo;
+use crate::ik_chain::{draw_ik_helpers, evaluate_ik_chains};
 use crate::rig::{draw_rig_debug, draw_weight_debug, Tool};
 
 /// Texture slot for the 3D viewport (`ui.texture(SCENE_TEX, …)`).
@@ -688,6 +689,9 @@ impl<D: Demo> Host<D> {
                 }
             }
 
+            // Pose IK: solve after tools so targets moved this frame apply.
+            evaluate_ik_chains(&mut self.state.scene, &self.state.rig);
+
             // Debug / gizmo after tools so pose matches this frame.
             self.state.scene.debug.clear();
             self.state.scene.debug.grid(
@@ -699,6 +703,7 @@ impl<D: Demo> Host<D> {
                 [0.28, 0.28, 0.30, 0.28], // major — still muted
             );
             draw_rig_debug(&mut self.state.scene, &self.state.rig);
+            draw_ik_helpers(&mut self.state.scene, &self.state.rig);
             draw_weight_debug(&mut self.state.scene, &mut self.state.rig);
             if let (Some(sel), Some(pivot)) = (
                 self.state.rig.selection,

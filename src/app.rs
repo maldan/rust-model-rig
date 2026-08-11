@@ -8,7 +8,9 @@ use crate::framework::{Demo, UiCtx, SCENE_TEX};
 use crate::gizmo::{self, RotateDrag, TranslateDrag};
 use crate::ik::{self, IkPullDrag};
 use crate::pick;
-use crate::rig::{empty_scene, AppMode, BoneId, MoveMode, RigDocument, Tool, TransformSpace};
+use crate::rig::{
+    empty_scene, AppMode, BoneId, IkControlKind, MoveMode, RigDocument, Tool, TransformSpace,
+};
 use crate::verlet::{self, VerletDrag};
 
 pub struct AppState {
@@ -27,6 +29,8 @@ pub struct AppState {
     pub edit_bone: Option<BoneId>,
     /// Host should re-read orbit cam from `scene.camera`.
     pub resync_camera: bool,
+    /// Bones that rotate when creating IK (tip's ancestors). Default 2 = arm/leg.
+    pub ik_create_length: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -52,6 +56,7 @@ impl AppState {
             edit_translation: Vec3::ZERO,
             edit_bone: None,
             resync_camera: false,
+            ik_create_length: 2,
         }
     }
 
@@ -763,6 +768,9 @@ fn bone_panel(ui: &mut Ui, state: &mut AppState) {
     }
 
     ui.separator();
+    ik_chains_section(ui, state);
+    ui.separator();
+
     let avail = ui.available_size();
     let roots = state.rig.roots();
     let prev = state.rig.selection;
@@ -800,6 +808,61 @@ fn bone_panel(ui: &mut Ui, state: &mut AppState) {
             state.edit_bone = None;
             state.status_from_selection();
         }
+    }
+}
+
+fn ik_chains_section(ui: &mut Ui, state: &mut AppState) {
+    ui.label_styled(
+        &format!("IK Chains ({})", state.rig.ik_chains.len()),
+        TextStyle {
+            color: [0.9, 0.9, 0.9, 1.0],
+            size: 13.0,
+        },
+    );
+
+    if state.rig.ik_chains.is_empty() {
+        ui.label("Select tip (hand/foot) → Create IK");
+        return;
+    }
+
+    let chains: Vec<(u32, String, bool)> = state
+        .rig
+        .ik_chains
+        .iter()
+        .map(|c| (c.id, c.name.clone(), c.enabled))
+        .collect();
+
+    for (id, name, enabled) in chains {
+        ui.horizontal(|ui| {
+            let label = if enabled {
+                format!("● {name}")
+            } else {
+                format!("○ {name}")
+            };
+            if ui.button(&label).clicked() {
+                state.rig.set_ik_enabled(id, !enabled);
+                state.status = if !enabled {
+                    format!("{name} enabled")
+                } else {
+                    format!("{name} muted")
+                };
+            }
+            if ui.button("Sel").clicked() {
+                if let Some(c) = state.rig.ik_chains.iter().find(|c| c.id == id) {
+                    let t = c.target;
+                    state.rig.set_selection(t);
+                    state.edit_bone = None;
+                    state.rig.tool = Tool::Translate;
+                    state.status_from_selection();
+                }
+            }
+            if ui.button("X").clicked() {
+                state.rig.remove_ik_chain(&mut state.scene, id);
+                state.clear_drags();
+                state.edit_bone = None;
+                state.status = format!("Removed {name}");
+            }
+        });
     }
 }
 
@@ -858,6 +921,12 @@ fn inspector_panel(ui: &mut Ui, state: &mut AppState) {
 
     ui.label(&format!("Name: {name}"));
     ui.label(&format!("Deform: {deform}"));
+    if let Some(kind) = state.rig.ik_control_kind(sel) {
+        ui.label(match kind {
+            IkControlKind::Target => "Role: IK Target (orange)",
+            IkControlKind::Pole => "Role: IK Pole (purple)",
+        });
+    }
     if let Some(p) = parent_name {
         ui.label(&format!("Parent: {p}"));
     } else {
@@ -865,7 +934,63 @@ fn inspector_panel(ui: &mut Ui, state: &mut AppState) {
     }
     ui.separator();
 
-    if state.rig.mode == AppMode::Edit {
+    // IK setup / manage
+    {
+        let existing = state.rig.ik_chain_for_tip(sel).map(|c| c.id);
+        let is_control = state.rig.ik_control_kind(sel).is_some();
+        if let Some(cid) = existing {
+            ui.label("IK on this tip");
+            if ui.button("Select IK target").clicked() {
+                if let Some(c) = state.rig.ik_chains.iter().find(|c| c.id == cid) {
+                    let t = c.target;
+                    state.rig.set_selection(t);
+                    state.edit_bone = None;
+                    state.rig.tool = Tool::Translate;
+                }
+            }
+            if ui.button("Remove IK").clicked() {
+                state.rig.remove_ik_chain(&mut state.scene, cid);
+                state.clear_drags();
+                state.edit_bone = None;
+                state.status = "IK removed".into();
+            }
+            ui.separator();
+        } else if !is_control {
+            ui.label("IK chain length (rotating bones)");
+            ui.horizontal(|ui| {
+                if ui.button("−").clicked() {
+                    state.ik_create_length = state.ik_create_length.saturating_sub(1).max(1);
+                }
+                ui.label(&format!("{}", state.ik_create_length));
+                if ui.button("+").clicked() {
+                    state.ik_create_length = (state.ik_create_length + 1).min(32);
+                }
+            });
+            if ui.button("Create IK").clicked() {
+                let len = state.ik_create_length;
+                match state.rig.create_ik_from_tip(&mut state.scene, sel, len) {
+                    Ok(_) => {
+                        state.edit_bone = None;
+                        state.rig.tool = Tool::Translate;
+                        if state.rig.mode != AppMode::Pose {
+                            state.set_mode(AppMode::Pose);
+                        }
+                        state.status = format!(
+                            "IK ×{len} · Move target, Rotate target = hand, Pole = elbow"
+                        );
+                    }
+                    Err(e) => {
+                        state.status = e.into();
+                    }
+                }
+            }
+            ui.separator();
+        }
+    }
+
+    if state.rig.mode == AppMode::Edit
+        || state.rig.ik_control_kind(sel).is_some()
+    {
         ui.label("Local translation");
         if ui
             .vec3("translation", &mut state.edit_translation, 0.01, Vec3::ZERO)

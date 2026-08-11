@@ -2,6 +2,7 @@ mod app;
 mod framework;
 mod gizmo;
 mod ik;
+mod ik_chain;
 mod pick;
 mod rig;
 mod verlet;

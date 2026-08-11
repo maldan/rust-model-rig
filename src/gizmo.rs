@@ -136,7 +136,9 @@ pub fn draw_translate_gizmo(
     let Some((_, basis)) = gizmo_basis(scene, bone, space) else {
         return;
     };
-    let origin = drag.map(|d| d.origin).unwrap_or(pivot);
+    // Follow the live pivot. `drag.origin` is only the grab-plane reference for math —
+    // freezing the draw origin made the gizmo stick until mouse-up.
+    let origin = pivot;
     let rotation = Quat::from_mat3(&basis);
     let highlight = drag.map(|d| d.axis).or(hover);
     scene.debug.gizmo(
