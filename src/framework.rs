@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 
 use glam::{Vec2, Vec3};
 use mega_render::{
-    Camera, DebugView, InputFrame, PostProcessSettings, Scene, ShadowSettings, Visualizer,
-    WgpuVisualizer,
+    view_gizmo, Camera, DebugView, InputFrame, PostProcessSettings, Scene, ShadowSettings,
+    Visualizer, WgpuVisualizer,
 };
 use mega_ui::wgpu::{DrawStats, UiRenderer};
 use mega_ui::{CursorIcon, DockState, Ui, UiInput};
@@ -20,7 +20,6 @@ use winit::window::{Window, WindowId};
 use crate::app::{handle_tools, AppState, PointerFrame};
 use crate::gizmo;
 use crate::rig::{draw_rig_debug, Tool};
-use crate::view_gizmo;
 
 /// Texture slot for the 3D viewport (`ui.texture(SCENE_TEX, …)`).
 pub const SCENE_TEX: u32 = 0;
@@ -646,9 +645,11 @@ impl<D: Demo> Host<D> {
 
                 let mut consumed = false;
                 if over_view_gizmo && self.input.mouse_pressed {
-                    if let Some(axis) = view_gizmo::hit_test(&self.state.scene, vp_size, local) {
+                    if let Some(axis) =
+                        view_gizmo::hit_test(&self.state.scene.camera, vp_size, local)
+                    {
                         self.orbit.snap_to_dir(axis.dir());
-                        self.state.status = format!("View {}", axis.label_view());
+                        self.state.status = format!("View {}", axis.label());
                         consumed = true;
                     }
                 }
@@ -719,9 +720,14 @@ impl<D: Demo> Host<D> {
                     scroll_delta: Vec2::ZERO,
                     dt,
                 };
-                view_gizmo::begin_hud(&mut self.state.scene, vp_size, hud_input);
-                view_gizmo::draw(&mut self.state.scene, vp_size, local);
-                view_gizmo::end_hud(&mut self.state.scene);
+                self.state.scene.hud.begin(&hud_input, vp_size);
+                view_gizmo::draw(
+                    &mut self.state.scene.hud,
+                    &self.state.scene.camera,
+                    vp_size,
+                    local,
+                );
+                let _ = self.state.scene.hud.end();
             }
 
             if let Some(text) = out.clipboard {
