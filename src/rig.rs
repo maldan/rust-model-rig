@@ -4,9 +4,10 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
-use glam::{Mat4, Vec3};
+use glam::Vec3;
 use mega_render::{
-    load_gltf, Camera, DirectionalLight, Handle, Light, Node, PointLight, Scene, Transform,
+    load_gltf, Camera, DirectionalLight, Handle, Light, LineOpts, Node, PointLight, Scene,
+    Transform,
 };
 
 #[derive(Clone, Copy)]
@@ -559,58 +560,65 @@ impl RigDocument {
     }
 }
 
-/// Draw skeleton with selection highlight (always overlay so mesh doesn't hide it).
+/// Stick bone display (screen-space px). Later: expose via settings UI.
+const BONE_LINE_W: f32 = 3.5;
+const BONE_OUTLINE_W: f32 = 7.5;
+const BONE_JOINT: f32 = 8.0;
+const BONE_JOINT_OUTLINE: f32 = 12.0;
+
+const BONE_FILL: [f32; 4] = [0.86, 0.86, 0.90, 1.0];
+const BONE_OUTLINE: [f32; 4] = [0.02, 0.02, 0.04, 1.0];
+/// Selected: bright fill + darker blue outline (both blue so selection pops).
+const BONE_SEL_FILL: [f32; 4] = [0.35, 0.72, 1.0, 1.0];
+const BONE_SEL_OUTLINE: [f32; 4] = [0.06, 0.22, 0.55, 1.0];
+
+/// Stick skeleton: thick outline + thinner fill, joint dots. Overlay so mesh never hides it.
 pub fn draw_rig_debug(scene: &mut Scene, rig: &RigDocument) {
     if !rig.show_skeleton {
         return;
     }
-    let base = [0.25, 0.95, 0.35, 1.0];
-    let sel_col = [0.15, 0.95, 1.0, 1.0];
-    let avg = rig.average_bone_length(scene);
-    let thickness = (avg * 0.08).clamp(0.008, 0.04);
-    let joint = thickness * 1.35;
     let segments = rig.bone_segments(scene);
+
+    // Outlines first (drawn under fills in submission order).
     for (from, to, id) in &segments {
-        let color = if rig.selection == Some(*id) {
-            sel_col
+        let outline = if rig.selection == Some(*id) {
+            BONE_SEL_OUTLINE
         } else {
-            base
+            BONE_OUTLINE
         };
-        if let Some(m) = bone_cuboid_matrix(*from, *to, thickness) {
-            scene.debug.box_transform(m, color, false);
-        }
-        // Small joint cube at the bone origin.
-        scene.debug.box_aabb(
-            *from - Vec3::splat(joint * 0.5),
-            *from + Vec3::splat(joint * 0.5),
-            color,
-            false,
+        scene.debug.line(
+            *from,
+            *to,
+            LineOpts::color(outline).width(BONE_OUTLINE_W).overlay(),
         );
     }
-}
-
-/// Unit box `[-0.5, 0.5]³` → thin cuboid from `from` to `to` (Y along the bone).
-fn bone_cuboid_matrix(from: Vec3, to: Vec3, thickness: f32) -> Option<Mat4> {
-    let dir = to - from;
-    let len = dir.length();
-    if len < 1e-6 {
-        return None;
+    for (from, to, id) in &segments {
+        let fill = if rig.selection == Some(*id) {
+            BONE_SEL_FILL
+        } else {
+            BONE_FILL
+        };
+        scene.debug.line(
+            *from,
+            *to,
+            LineOpts::color(fill).width(BONE_LINE_W).overlay(),
+        );
     }
-    let axis = dir / len;
-    let hint = if axis.cross(Vec3::Y).length_squared() < 1e-4 {
-        Vec3::Z
-    } else {
-        Vec3::Y
-    };
-    let side = axis.cross(hint).normalize();
-    let up = side.cross(axis).normalize();
-    let mid = (from + to) * 0.5;
-    Some(Mat4::from_cols(
-        (side * thickness).extend(0.0),
-        (axis * len).extend(0.0),
-        (up * thickness).extend(0.0),
-        mid.extend(1.0),
-    ))
+
+    // Joint dots at bone origins (points render after lines → sit on top).
+    for b in &rig.bones {
+        let pos = scene.world_matrix(b.id.node).transform_point3(Vec3::ZERO);
+        let selected = rig.selection == Some(b.id);
+        let (outline, fill) = if selected {
+            (BONE_SEL_OUTLINE, BONE_SEL_FILL)
+        } else {
+            (BONE_OUTLINE, BONE_FILL)
+        };
+        scene
+            .debug
+            .point_ex(pos, outline, BONE_JOINT_OUTLINE, false);
+        scene.debug.point_ex(pos, fill, BONE_JOINT, false);
+    }
 }
 
 pub fn empty_scene() -> Scene {

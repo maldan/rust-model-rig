@@ -336,9 +336,14 @@ impl Demo for RigApp {
     }
 
     fn build_ui(ui: &mut Ui, ctx: &mut UiCtx<'_>) -> bool {
+        // Match mega_ui theme::MENU_BAR_H / STATUS_BAR_H. Reserve one root
+        // spacing gap between menu and dock — otherwise the status label was a
+        // plain root widget pushed past the framebuffer (clipped in half).
+        let menu_h = 26.0 * ui.scale();
         let status_h = 24.0 * ui.scale();
-        let menu_h = 28.0 * ui.scale();
-        let dock_h = (ctx.window_size.y - status_h - menu_h).max(1.0);
+        // Root layout inserts default spacing (6px) between menu and dock.
+        let gap = 6.0 * ui.scale();
+        let dock_h = (ctx.window_size.y - menu_h - status_h - gap).max(1.0);
         let dock_size = Vec2::new(ctx.window_size.x, dock_h);
 
         ui.menu_bar(|ui| {
@@ -415,13 +420,15 @@ impl Demo for RigApp {
             _ => {}
         });
 
-        ui.label_styled(
-            &format!("{:.0} fps · {:.1} ms · {}", fps, frame_ms, state.status),
-            TextStyle {
-                color: [0.65, 0.68, 0.72, 1.0],
-                size: 12.0,
-            },
-        );
+        ui.status_bar(|ui| {
+            ui.label_styled(
+                &format!("{:.0} fps · {:.1} ms · {}", fps, frame_ms, state.status),
+                TextStyle {
+                    color: [0.65, 0.68, 0.72, 1.0],
+                    size: 12.0,
+                },
+            );
+        });
 
         keep || state.has_drag()
     }
