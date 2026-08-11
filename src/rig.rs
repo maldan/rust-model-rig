@@ -46,6 +46,8 @@ pub enum AppMode {
     /// FK pose on top of bind (current behaviour).
     #[default]
     Pose,
+    /// Shape keys / morph sculpt (bind pose).
+    Shape,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -56,6 +58,19 @@ pub enum Tool {
     AddBone,
     Translate,
     Rotate,
+    /// Shape mode: sculpt brush (`brush_kind`).
+    Brush,
+}
+
+/// Sculpt brush mode (Shape + `Tool::Brush`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BrushKind {
+    #[default]
+    Grab,
+    /// Push / pull along vertex normals.
+    Inflate,
+    /// Laplacian relax toward neighbors.
+    Smooth,
 }
 
 /// How the Move tool applies translation (Pose). Edit always uses FK.
@@ -192,12 +207,22 @@ pub struct RigDocument {
     pub ik_chains: Vec<IkChain>,
     /// Soft / secondary bone chains (gravity + support).
     pub soft_chains: Vec<SoftChain>,
+    /// Mesh used for shape-key editing.
+    pub active_mesh: Option<Handle<Mesh>>,
+    /// Active morph target index on `active_mesh`.
+    pub active_shape: Option<usize>,
+    /// Grab brush radius in world units.
+    pub brush_radius: f32,
+    /// Grab brush strength multiplier (0–1).
+    pub brush_strength: f32,
+    pub brush_kind: BrushKind,
     /// Screen-space rect of the 3D viewport (updated each UI frame).
     pub viewport_rect: mega_ui::Rect,
     /// Counter for default bone names.
     next_bone_serial: u32,
     next_ik_serial: u32,
     next_soft_serial: u32,
+    next_shape_serial: u32,
 }
 
 impl Default for RigDocument {
@@ -220,6 +245,11 @@ impl Default for RigDocument {
             transform_space: TransformSpace::Local,
             ik_chains: Vec::new(),
             soft_chains: Vec::new(),
+            active_mesh: None,
+            active_shape: None,
+            brush_radius: 0.08,
+            brush_strength: 0.65,
+            brush_kind: BrushKind::Grab,
             viewport_rect: mega_ui::Rect {
                 min: glam::Vec2::ZERO,
                 max: glam::Vec2::ZERO,
@@ -227,6 +257,7 @@ impl Default for RigDocument {
             next_bone_serial: 1,
             next_ik_serial: 1,
             next_soft_serial: 1,
+            next_shape_serial: 1,
         }
     }
 }
@@ -337,9 +368,15 @@ impl RigDocument {
         self.bind_locals.clear();
         self.ik_chains.clear();
         self.soft_chains.clear();
+        self.active_mesh = None;
+        self.active_shape = None;
+        self.brush_radius = 0.08;
+        self.brush_strength = 0.65;
+        self.brush_kind = BrushKind::Grab;
         self.next_bone_serial = 1;
         self.next_ik_serial = 1;
         self.next_soft_serial = 1;
+        self.next_shape_serial = 1;
         self.weight_overlay.clear();
         self.show_weights = false;
         self.move_mode = MoveMode::Fk;
@@ -380,8 +417,46 @@ impl RigDocument {
                 self.capture_bind_pose(scene);
                 self.tool = Tool::Rotate;
             }
+            AppMode::Shape => {
+                // Sculpt against bind geometry.
+                self.reset_pose(scene);
+                self.tool = Tool::Brush;
+                if self.active_mesh.is_none() {
+                    self.active_mesh = first_mesh(scene);
+                }
+            }
         }
         self.mode = mode;
+    }
+
+    pub fn create_shape_key(&mut self, scene: &mut Scene) -> Option<usize> {
+        let mesh_h = self.active_mesh.or_else(|| {
+            let h = first_mesh(scene);
+            self.active_mesh = h;
+            h
+        })?;
+        let mesh = scene.meshes.get_mut(mesh_h)?;
+        let name = format!("Key_{}", self.next_shape_serial);
+        self.next_shape_serial += 1;
+        let idx = mesh.add_shape_key(name);
+        mesh.set_morph_weight(idx, 1.0);
+        self.active_shape = Some(idx);
+        Some(idx)
+    }
+
+    pub fn delete_active_shape(&mut self, scene: &mut Scene) {
+        let (Some(mesh_h), Some(idx)) = (self.active_mesh, self.active_shape) else {
+            return;
+        };
+        let Some(mesh) = scene.meshes.get_mut(mesh_h) else {
+            return;
+        };
+        mesh.remove_shape_key(idx);
+        self.active_shape = if mesh.morph_targets.is_empty() {
+            None
+        } else {
+            Some(idx.min(mesh.morph_targets.len() - 1))
+        };
     }
 
     pub fn write_bind_for(&mut self, scene: &Scene, id: BoneId) {
@@ -1524,4 +1599,8 @@ pub fn empty_scene() -> Scene {
         enabled: true,
     }));
     scene
+}
+
+fn first_mesh(scene: &Scene) -> Option<Handle<Mesh>> {
+    scene.nodes.iter().find_map(|(_, n)| n.mesh)
 }

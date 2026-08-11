@@ -5,6 +5,7 @@ mod ik;
 mod ik_chain;
 mod pick;
 mod soft_chain;
+mod sculpt;
 mod rig;
 mod verlet;
 

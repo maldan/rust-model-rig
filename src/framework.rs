@@ -20,7 +20,8 @@ use winit::window::{Window, WindowId};
 use crate::app::{handle_tools, AppState, PointerFrame};
 use crate::gizmo;
 use crate::ik_chain::{draw_ik_helpers, evaluate_ik_chains};
-use crate::rig::{draw_rig_debug, draw_weight_debug, Tool};
+use crate::rig::{draw_rig_debug, draw_weight_debug, AppMode, Tool};
+use crate::sculpt;
 use crate::soft_chain::{draw_soft_helpers, evaluate_soft_chains};
 
 /// Texture slot for the 3D viewport (`ui.texture(SCENE_TEX, …)`).
@@ -716,35 +717,54 @@ impl<D: Demo> Host<D> {
             draw_ik_helpers(&mut self.state.scene, &self.state.rig);
             draw_soft_helpers(&mut self.state.scene, &self.state.rig);
             draw_weight_debug(&mut self.state.scene, &mut self.state.rig);
-            if let (Some(sel), Some(pivot)) = (
-                self.state.rig.selection,
-                self.state.gizmo_pivot(),
-            ) {
-                let radius = self.state.gizmo_radius();
-                match self.state.rig.tool {
-                    Tool::Rotate => {
-                        gizmo::draw_rotate_gizmo(
-                            &mut self.state.scene,
-                            sel,
-                            pivot,
-                            radius,
-                            self.state.rig.transform_space,
-                            self.state.gizmo_hover,
-                            self.state.rotate_drag.as_ref(),
-                        );
+            if self.state.rig.mode == AppMode::Shape
+                && self.state.rig.tool == Tool::Brush
+                && !self.state.has_drag()
+            {
+                let rect = self.state.rig.viewport_rect;
+                if rect.width() > 1.0
+                    && rect.height() > 1.0
+                    && rect.contains(self.input.mouse_pos)
+                {
+                    sculpt::draw_brush_cursor(
+                        &mut self.state.scene,
+                        rect,
+                        self.input.mouse_pos,
+                        self.state.rig.brush_radius,
+                    );
+                }
+            }
+            if self.state.rig.mode != AppMode::Shape {
+                if let (Some(sel), Some(pivot)) = (
+                    self.state.rig.selection,
+                    self.state.gizmo_pivot(),
+                ) {
+                    let radius = self.state.gizmo_radius();
+                    match self.state.rig.tool {
+                        Tool::Rotate => {
+                            gizmo::draw_rotate_gizmo(
+                                &mut self.state.scene,
+                                sel,
+                                pivot,
+                                radius,
+                                self.state.rig.transform_space,
+                                self.state.gizmo_hover,
+                                self.state.rotate_drag.as_ref(),
+                            );
+                        }
+                        Tool::Translate => {
+                            gizmo::draw_translate_gizmo(
+                                &mut self.state.scene,
+                                sel,
+                                pivot,
+                                radius,
+                                self.state.rig.transform_space,
+                                self.state.gizmo_hover,
+                                self.state.translate_drag.as_ref(),
+                            );
+                        }
+                        _ => {}
                     }
-                    Tool::Translate => {
-                        gizmo::draw_translate_gizmo(
-                            &mut self.state.scene,
-                            sel,
-                            pivot,
-                            radius,
-                            self.state.rig.transform_space,
-                            self.state.gizmo_hover,
-                            self.state.translate_drag.as_ref(),
-                        );
-                    }
-                    _ => {}
                 }
             }
 
@@ -1037,19 +1057,60 @@ impl<D: Demo> ApplicationHandler for Host<D> {
                             KeyCode::Tab => {
                                 let next = match self.state.rig.mode {
                                     crate::rig::AppMode::Edit => crate::rig::AppMode::Pose,
-                                    crate::rig::AppMode::Pose => crate::rig::AppMode::Edit,
+                                    crate::rig::AppMode::Pose => crate::rig::AppMode::Shape,
+                                    crate::rig::AppMode::Shape => crate::rig::AppMode::Edit,
                                 };
                                 self.state.set_mode(next);
                             }
-                            KeyCode::KeyR | KeyCode::Digit3 => {
-                                self.state.rig.tool = crate::rig::Tool::Rotate;
-                                self.state.clear_drags();
-                                self.state.status = "Tool: Rotate".into();
+                            KeyCode::KeyR => {
+                                if self.state.rig.mode != crate::rig::AppMode::Shape {
+                                    self.state.rig.tool = crate::rig::Tool::Rotate;
+                                    self.state.clear_drags();
+                                    self.state.status = "Tool: Rotate".into();
+                                }
                             }
                             KeyCode::KeyG | KeyCode::Digit2 => {
-                                self.state.rig.tool = crate::rig::Tool::Translate;
-                                self.state.clear_drags();
-                                self.state.status = "Tool: Move".into();
+                                if self.state.rig.mode == crate::rig::AppMode::Shape {
+                                    self.state.rig.tool = crate::rig::Tool::Brush;
+                                    self.state.rig.brush_kind = crate::rig::BrushKind::Grab;
+                                    self.state.clear_drags();
+                                    self.state.status = "Tool: Grab".into();
+                                } else {
+                                    self.state.rig.tool = crate::rig::Tool::Translate;
+                                    self.state.clear_drags();
+                                    self.state.status = "Tool: Move".into();
+                                }
+                            }
+                            KeyCode::KeyI | KeyCode::Digit3 => {
+                                if self.state.rig.mode == crate::rig::AppMode::Shape {
+                                    self.state.rig.tool = crate::rig::Tool::Brush;
+                                    self.state.rig.brush_kind = crate::rig::BrushKind::Inflate;
+                                    self.state.clear_drags();
+                                    self.state.status = "Tool: Inflate".into();
+                                } else {
+                                    self.state.rig.tool = crate::rig::Tool::Rotate;
+                                    self.state.clear_drags();
+                                    self.state.status = "Tool: Rotate".into();
+                                }
+                            }
+                            KeyCode::KeyU | KeyCode::Digit4 => {
+                                if self.state.rig.mode == crate::rig::AppMode::Shape {
+                                    self.state.rig.tool = crate::rig::Tool::Brush;
+                                    self.state.rig.brush_kind = crate::rig::BrushKind::Smooth;
+                                    self.state.clear_drags();
+                                    self.state.status = "Tool: Smooth".into();
+                                }
+                            }
+                            KeyCode::KeyB => {
+                                if self.state.rig.mode == crate::rig::AppMode::Shape {
+                                    self.state.rig.tool = crate::rig::Tool::Brush;
+                                    self.state.clear_drags();
+                                    self.state.status = match self.state.rig.brush_kind {
+                                        crate::rig::BrushKind::Grab => "Tool: Grab".into(),
+                                        crate::rig::BrushKind::Inflate => "Tool: Inflate".into(),
+                                        crate::rig::BrushKind::Smooth => "Tool: Smooth".into(),
+                                    };
+                                }
                             }
                             KeyCode::KeyA => {
                                 if self.state.rig.mode == crate::rig::AppMode::Edit {
@@ -1084,6 +1145,9 @@ impl<D: Demo> ApplicationHandler for Host<D> {
                                         self.state.edit_bone = None;
                                         self.state.status = "Deleted bone subtree".into();
                                     }
+                                } else if self.state.rig.mode == crate::rig::AppMode::Shape {
+                                    self.state.rig.delete_active_shape(&mut self.state.scene);
+                                    self.state.status = "Deleted shape key".into();
                                 }
                             }
                             KeyCode::Digit1 => {

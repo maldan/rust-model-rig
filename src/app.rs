@@ -9,8 +9,10 @@ use crate::gizmo::{self, RotateDrag, TranslateDrag};
 use crate::ik::{self, IkPullDrag};
 use crate::pick;
 use crate::rig::{
-    empty_scene, AppMode, BoneId, IkControlKind, MoveMode, RigDocument, Tool, TransformSpace,
+    empty_scene, AppMode, BoneId, BrushKind, IkControlKind, MoveMode, RigDocument, Tool,
+    TransformSpace,
 };
+use crate::sculpt::{self, SculptDrag};
 use crate::verlet::{self, VerletDrag};
 
 pub struct AppState {
@@ -21,6 +23,7 @@ pub struct AppState {
     pub translate_drag: Option<TranslateDrag>,
     pub ik_drag: Option<IkPullDrag>,
     pub verlet_drag: Option<VerletDrag>,
+    pub sculpt_drag: Option<SculptDrag>,
     pub marquee: Option<MarqueeDrag>,
     pub gizmo_hover: Option<GizmoAxis>,
     /// Euler degrees shown in inspector (synced from selection).
@@ -52,6 +55,7 @@ impl AppState {
             translate_drag: None,
             ik_drag: None,
             verlet_drag: None,
+            sculpt_drag: None,
             marquee: None,
             gizmo_hover: None,
             edit_euler_deg: Vec3::ZERO,
@@ -68,6 +72,7 @@ impl AppState {
             || self.translate_drag.is_some()
             || self.ik_drag.is_some()
             || self.verlet_drag.is_some()
+            || self.sculpt_drag.is_some()
             || self.marquee.is_some()
     }
 
@@ -76,6 +81,7 @@ impl AppState {
         self.translate_drag = None;
         self.ik_drag = None;
         self.verlet_drag = None;
+        self.sculpt_drag = None;
         self.marquee = None;
     }
 
@@ -149,6 +155,7 @@ impl AppState {
         self.status = match mode {
             AppMode::Edit => "Edit mode — rest pose / hierarchy".into(),
             AppMode::Pose => "Pose mode — FK rotate".into(),
+            AppMode::Shape => "Shape mode — Grab / Inflate / Smooth on shape keys".into(),
         };
     }
 
@@ -264,9 +271,35 @@ pub fn handle_tools(state: &mut AppState, pointer: &PointerFrame, ui_wants_mouse
         return;
     }
 
-    // Hover gizmo handles.
+    // Shape sculpt stroke.
+    if state.sculpt_drag.is_some() {
+        if pointer.down {
+            let strength = state.rig.brush_strength;
+            let radius = state.rig.brush_radius;
+            let invert = pointer.ctrl;
+            if let Some(ref mut drag) = state.sculpt_drag {
+                sculpt::apply_stroke(
+                    &mut state.scene,
+                    drag,
+                    rect,
+                    pointer.pos,
+                    radius,
+                    strength,
+                    invert,
+                );
+            }
+            state.rig.invalidate_weight_overlay();
+        }
+        return;
+    }
+
+    // Hover gizmo handles (bone tools only).
     state.gizmo_hover = None;
-    if over && state.rig.selection.is_some() && !state.has_drag() {
+    if state.rig.mode != AppMode::Shape
+        && over
+        && state.rig.selection.is_some()
+        && !state.has_drag()
+    {
         if let (Some(sel), Some(pivot)) = (state.rig.selection, state.gizmo_pivot()) {
             let radius = state.gizmo_radius();
             state.gizmo_hover = match state.rig.tool {
@@ -359,6 +392,54 @@ pub fn handle_tools(state: &mut AppState, pointer: &PointerFrame, ui_wants_mouse
         return;
     }
 
+    // Shape mode: grab brush / mesh select.
+    if state.rig.mode == AppMode::Shape {
+        if state.rig.tool == Tool::Brush {
+            if state.rig.active_shape.is_none() {
+                state.status = "Create / select a shape key first".into();
+                return;
+            }
+            // Ensure active weight visible while sculpting.
+            if let (Some(mesh_h), Some(idx)) = (state.rig.active_mesh, state.rig.active_shape) {
+                if let Some(mesh) = state.scene.meshes.get_mut(mesh_h) {
+                    let w = mesh.morph_weights.get(idx).copied().unwrap_or(0.0);
+                    if w < 0.05 {
+                        mesh.set_morph_weight(idx, 1.0);
+                    }
+                }
+            }
+            if let Some(drag) =
+                sculpt::begin_stroke(&state.scene, &state.rig, rect, pointer.pos)
+            {
+                state.rig.active_mesh = Some(drag.mesh);
+                state.sculpt_drag = Some(drag);
+                state.status = match state.rig.brush_kind {
+                    BrushKind::Grab => "Grab…".into(),
+                    BrushKind::Inflate => {
+                        if pointer.ctrl {
+                            "Deflate…".into()
+                        } else {
+                            "Inflate…".into()
+                        }
+                    }
+                    BrushKind::Smooth => "Smooth…".into(),
+                };
+            }
+            return;
+        }
+        // Select tool: pick mesh under cursor.
+        if let Some(ray) = pick::ray_from_viewport(&state.scene, rect, pointer.pos) {
+            if let Some(hit) = sculpt::pick_mesh(&state.scene, &ray) {
+                state.rig.active_mesh = Some(hit.mesh);
+                state.status = format!(
+                    "Mesh {}:{}",
+                    hit.mesh.index, hit.mesh.generation
+                );
+            }
+        }
+        return;
+    }
+
     let roots = state.rig.selection_roots();
 
     // Gizmo grab first — only selection roots transform; children follow FK.
@@ -441,7 +522,7 @@ pub fn handle_tools(state: &mut AppState, pointer: &PointerFrame, ui_wants_mouse
                 }
                 return;
             }
-            Tool::Select => {}
+            Tool::Select | Tool::Brush => {}
         }
     } else if state.rig.tool == Tool::AddBone {
         if let Some(hit) = gizmo::ray_ground_hit(&state.scene, rect, pointer.pos) {
@@ -501,7 +582,7 @@ pub fn default_dock() -> DockState {
         DockNode::leaf(&["Viewport"]),
         DockNode::split_v(
             0.58,
-            DockNode::leaf(&["Bones"]),
+            DockNode::leaf(&["Bones", "Shapes"]),
             DockNode::leaf(&["Inspector"]),
         ),
     ))
@@ -568,6 +649,9 @@ impl Demo for RigApp {
                 if ui.menu_item("Pose").clicked() {
                     ctx.state.set_mode(AppMode::Pose);
                 }
+                if ui.menu_item("Shape keys").clicked() {
+                    ctx.state.set_mode(AppMode::Shape);
+                }
             });
             ui.menu("View", |ui| {
                 let skel = ctx.state.rig.show_skeleton;
@@ -626,6 +710,9 @@ impl Demo for RigApp {
             "Bones" => {
                 bone_panel(ui, state);
             }
+            "Shapes" => {
+                shapes_panel(ui, state);
+            }
             "Inspector" => {
                 inspector_panel(ui, state);
                 keep |= state.edit_bone.is_some();
@@ -652,12 +739,16 @@ fn viewport_toolbar(ui: &mut Ui, state: &mut AppState) {
         let mut mode_i = match state.rig.mode {
             AppMode::Edit => 0,
             AppMode::Pose => 1,
+            AppMode::Shape => 2,
         };
-        if ui.toggle("app_mode", &mut mode_i, &["Edit", "Pose"]).changed() {
-            state.set_mode(if mode_i == 0 {
-                AppMode::Edit
-            } else {
-                AppMode::Pose
+        if ui
+            .toggle("app_mode", &mut mode_i, &["Edit", "Pose", "Shape"])
+            .changed()
+        {
+            state.set_mode(match mode_i {
+                0 => AppMode::Edit,
+                2 => AppMode::Shape,
+                _ => AppMode::Pose,
             });
         }
 
@@ -668,6 +759,7 @@ fn viewport_toolbar(ui: &mut Ui, state: &mut AppState) {
                     Tool::Translate => 1,
                     Tool::Rotate => 2,
                     Tool::AddBone => 3,
+                    Tool::Brush => 0,
                 };
                 if ui
                     .toggle("tool_edit", &mut tool_i, &["Select", "Move", "Rotate", "Add"])
@@ -723,9 +815,44 @@ fn viewport_toolbar(ui: &mut Ui, state: &mut AppState) {
                     }
                 }
             }
+            AppMode::Shape => {
+                let mut tool_i = match (state.rig.tool, state.rig.brush_kind) {
+                    (Tool::Brush, BrushKind::Grab) => 1,
+                    (Tool::Brush, BrushKind::Inflate) => 2,
+                    (Tool::Brush, BrushKind::Smooth) => 3,
+                    _ => 0,
+                };
+                if ui
+                    .toggle(
+                        "tool_shape",
+                        &mut tool_i,
+                        &["Select", "Grab", "Inflate", "Smooth"],
+                    )
+                    .changed()
+                {
+                    match tool_i {
+                        1 => {
+                            state.rig.tool = Tool::Brush;
+                            state.rig.brush_kind = BrushKind::Grab;
+                        }
+                        2 => {
+                            state.rig.tool = Tool::Brush;
+                            state.rig.brush_kind = BrushKind::Inflate;
+                        }
+                        3 => {
+                            state.rig.tool = Tool::Brush;
+                            state.rig.brush_kind = BrushKind::Smooth;
+                        }
+                        _ => state.rig.tool = Tool::Select,
+                    }
+                    state.clear_drags();
+                }
+            }
         }
 
-        if matches!(state.rig.tool, Tool::Translate | Tool::Rotate) {
+        if matches!(state.rig.tool, Tool::Translate | Tool::Rotate)
+            && state.rig.mode != AppMode::Shape
+        {
             let mut space_i = match state.rig.transform_space {
                 TransformSpace::Local => 0,
                 TransformSpace::World => 1,
@@ -742,6 +869,172 @@ fn viewport_toolbar(ui: &mut Ui, state: &mut AppState) {
             }
         }
     });
+}
+
+fn shapes_panel(ui: &mut Ui, state: &mut AppState) {
+    ui.label_styled(
+        "Shape Keys",
+        TextStyle {
+            color: [0.9, 0.9, 0.9, 1.0],
+            size: 14.0,
+        },
+    );
+
+    if state.rig.mode != AppMode::Shape {
+        ui.horizontal(|ui| {
+            ui.label("Not in Shape mode.");
+            if ui.button("Shape").clicked() {
+                state.set_mode(AppMode::Shape);
+            }
+        });
+        ui.separator();
+    }
+
+    // Unique meshes (one entry per mesh handle).
+    let mut meshes: Vec<(mega_render::Handle<mega_render::Mesh>, String)> = Vec::new();
+    for (_, n) in state.scene.nodes.iter() {
+        let Some(h) = n.mesh else {
+            continue;
+        };
+        if meshes.iter().any(|(mh, _)| mh.key() == h.key()) {
+            continue;
+        }
+        if state.scene.meshes.get(h).is_none() {
+            continue;
+        }
+        let label = if n.name.is_empty() {
+            format!("Mesh {}", h.index)
+        } else {
+            n.name.clone()
+        };
+        meshes.push((h, label));
+    }
+
+    if meshes.is_empty() {
+        ui.label("No meshes — open a glTF model.");
+        return;
+    }
+
+    if state
+        .rig
+        .active_mesh
+        .is_none_or(|a| !meshes.iter().any(|(h, _)| h.key() == a.key()))
+    {
+        state.rig.active_mesh = Some(meshes[0].0);
+        state.rig.active_shape = None;
+    }
+
+    let mut mesh_i = state
+        .rig
+        .active_mesh
+        .and_then(|a| meshes.iter().position(|(h, _)| h.key() == a.key()))
+        .unwrap_or(0);
+    let mesh_labels: Vec<String> = meshes.iter().map(|(_, n)| n.clone()).collect();
+    let mesh_opts: Vec<&str> = mesh_labels.iter().map(|s| s.as_str()).collect();
+    if ui.select("shape_mesh", &mut mesh_i, &mesh_opts).changed() {
+        state.rig.active_mesh = Some(meshes[mesh_i].0);
+        state.rig.active_shape = None;
+        if state.rig.mode != AppMode::Shape {
+            state.set_mode(AppMode::Shape);
+        }
+    }
+
+    ui.horizontal(|ui| {
+        if ui.button("+ Shape").clicked() {
+            if state.rig.mode != AppMode::Shape {
+                state.set_mode(AppMode::Shape);
+            }
+            if let Some(idx) = state.rig.create_shape_key(&mut state.scene) {
+                state.status = format!("Created shape key #{idx}");
+            } else {
+                state.status = "No mesh for shape key".into();
+            }
+        }
+        if ui.button("Delete").clicked() {
+            state.rig.delete_active_shape(&mut state.scene);
+            state.status = "Deleted shape key".into();
+        }
+    });
+
+    ui.separator();
+    ui.label("Brush · radius / strength");
+    ui.label(match state.rig.brush_kind {
+        BrushKind::Grab => "Grab — drag surface",
+        BrushKind::Inflate => "Inflate — hold/drag (Ctrl = deflate)",
+        BrushKind::Smooth => "Smooth — hold/drag to relax",
+    });
+    let _ = ui.slider("brush_radius", &mut state.rig.brush_radius, 0.005..=0.5);
+    let _ = ui.slider("brush_strength", &mut state.rig.brush_strength, 0.05..=1.0);
+
+    ui.separator();
+    let Some(mesh_h) = state.rig.active_mesh else {
+        return;
+    };
+
+    let keys: Vec<(usize, String, f32)> = {
+        let Some(mesh) = state.scene.meshes.get(mesh_h) else {
+            ui.label("Mesh missing.");
+            return;
+        };
+        mesh.morph_targets
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let w = mesh.morph_weights.get(i).copied().unwrap_or(0.0);
+                (i, t.name.clone(), w)
+            })
+            .collect()
+    };
+
+    ui.label_styled(
+        &format!("Keys ({})", keys.len()),
+        TextStyle {
+            color: [0.9, 0.9, 0.9, 1.0],
+            size: 13.0,
+        },
+    );
+
+    if keys.is_empty() {
+        ui.label("No shape keys — press + Shape.");
+        return;
+    }
+
+    let avail = ui.available_size();
+    let active = state.rig.active_shape;
+    let mut clicked: Option<usize> = None;
+    let mut weight_edits: Vec<(usize, f32)> = Vec::new();
+
+    ui.scroll_area("shapes_scroll", avail, ScrollAxes::Vertical, |ui| {
+        for (i, name, mut w) in keys {
+            let selected = active == Some(i);
+            if ui
+                .selectable(&format!("shape_{i}"), selected, |ui| {
+                    ui.label(&name);
+                })
+                .clicked()
+            {
+                clicked = Some(i);
+            }
+            if ui.slider(&format!("shape_w_{i}"), &mut w, 0.0..=1.0).changed() {
+                weight_edits.push((i, w));
+                clicked = Some(i);
+            }
+        }
+    });
+
+    for (i, w) in weight_edits {
+        if let Some(mesh) = state.scene.meshes.get_mut(mesh_h) {
+            mesh.set_morph_weight(i, w);
+        }
+        state.rig.invalidate_weight_overlay();
+    }
+
+    if let Some(i) = clicked {
+        state.rig.active_shape = Some(i);
+        if state.rig.mode != AppMode::Shape {
+            state.set_mode(AppMode::Shape);
+        }
+    }
 }
 
 fn bone_panel(ui: &mut Ui, state: &mut AppState) {
