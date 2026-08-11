@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 
 use glam::Vec3;
 use mega_render::{
-    load_gltf, Camera, DirectionalLight, Handle, Light, LineOpts, Node, PointLight, Scene,
-    Transform,
+    load_gltf, Camera, DirectionalLight, Handle, Light, LineOpts, Mesh, Node, PointLight, PolyOpts,
+    Scene, Skin, Transform,
 };
 
 #[derive(Clone, Copy)]
@@ -67,6 +67,28 @@ pub struct BoneInfo {
     pub deform: bool,
 }
 
+#[derive(Clone)]
+struct WeightOverlayCache {
+    dirty: bool,
+    tris: Vec<(Vec3, Vec3, Vec3, [f32; 4])>,
+}
+
+impl Default for WeightOverlayCache {
+    fn default() -> Self {
+        Self {
+            dirty: true,
+            tris: Vec::new(),
+        }
+    }
+}
+
+impl WeightOverlayCache {
+    fn clear(&mut self) {
+        self.tris.clear();
+        self.dirty = true;
+    }
+}
+
 pub struct RigDocument {
     pub source_path: Option<PathBuf>,
     pub model_root: Option<Handle<Node>>,
@@ -80,6 +102,10 @@ pub struct RigDocument {
     pub bind_locals: HashMap<(u32, u32), Transform>,
     pub show_skeleton: bool,
     pub show_mesh: bool,
+    /// Heat-map overlay for selected bone influence on skinned meshes.
+    pub show_weights: bool,
+    /// Cached weight tris; rebuilt only when dirty (selection / pose / load).
+    weight_overlay: WeightOverlayCache,
     pub mode: AppMode,
     pub tool: Tool,
     /// Screen-space rect of the 3D viewport (updated each UI frame).
@@ -100,6 +126,8 @@ impl Default for RigDocument {
             bind_locals: HashMap::new(),
             show_skeleton: true,
             show_mesh: true,
+            show_weights: false,
+            weight_overlay: WeightOverlayCache::default(),
             mode: AppMode::Pose,
             tool: Tool::Rotate,
             viewport_rect: mega_ui::Rect {
@@ -112,15 +140,22 @@ impl Default for RigDocument {
 }
 
 impl RigDocument {
+    /// Mark weight overlay for rebuild (selection / pose / mesh change).
+    pub fn invalidate_weight_overlay(&mut self) {
+        self.weight_overlay.dirty = true;
+    }
+
     pub fn clear_selection(&mut self) {
         self.selected.clear();
         self.selection = None;
+        self.invalidate_weight_overlay();
     }
 
     pub fn set_selection(&mut self, id: BoneId) {
         self.selected.clear();
         self.selected.insert(id);
         self.selection = Some(id);
+        self.invalidate_weight_overlay();
     }
 
     pub fn toggle_selection(&mut self, id: BoneId) {
@@ -133,6 +168,7 @@ impl RigDocument {
             self.selected.insert(id);
             self.selection = Some(id);
         }
+        self.invalidate_weight_overlay();
     }
 
     /// Replace or union selection with `ids`. Active = last id (if any).
@@ -147,6 +183,7 @@ impl RigDocument {
         if let Some(&last) = ids.last() {
             self.selection = Some(last);
         }
+        self.invalidate_weight_overlay();
     }
 
     pub fn is_selected(&self, id: BoneId) -> bool {
@@ -207,6 +244,7 @@ impl RigDocument {
         self.clear_selection();
         self.bind_locals.clear();
         self.next_bone_serial = 1;
+        self.weight_overlay.clear();
     }
 
     /// Empty scene + root bone (+ tip child so a segment is visible).
@@ -515,7 +553,7 @@ impl RigDocument {
         }
     }
 
-    pub fn reset_pose(&self, scene: &mut Scene) {
+    pub fn reset_pose(&mut self, scene: &mut Scene) {
         for b in &self.bones {
             if let Some(local) = self.bind_locals.get(&b.id.node.key()).copied() {
                 if let Some(n) = scene.nodes.get_mut(b.id.node) {
@@ -523,9 +561,10 @@ impl RigDocument {
                 }
             }
         }
+        self.invalidate_weight_overlay();
     }
 
-    pub fn reset_selected(&self, scene: &mut Scene) {
+    pub fn reset_selected(&mut self, scene: &mut Scene) {
         for id in &self.selected {
             let Some(local) = self.bind_locals.get(&id.node.key()).copied() else {
                 continue;
@@ -534,6 +573,7 @@ impl RigDocument {
                 n.local = local;
             }
         }
+        self.invalidate_weight_overlay();
     }
 
     pub fn bone(&self, id: BoneId) -> Option<&BoneInfo> {
@@ -666,6 +706,221 @@ const BONE_OUTLINE: [f32; 4] = [0.02, 0.02, 0.04, 1.0];
 /// Selected: bright fill + darker blue outline (both blue so selection pops).
 const BONE_SEL_FILL: [f32; 4] = [0.35, 0.72, 1.0, 1.0];
 const BONE_SEL_OUTLINE: [f32; 4] = [0.06, 0.22, 0.55, 1.0];
+
+/// Blender-ish weight ramp: blue → cyan → green → yellow → red.
+fn weight_heat(w: f32) -> [f32; 4] {
+    let t = w.clamp(0.0, 1.0);
+    const STOPS: [(f32, [f32; 3]); 5] = [
+        (0.0, [0.05, 0.15, 0.95]),
+        (0.25, [0.05, 0.75, 0.85]),
+        (0.5, [0.15, 0.85, 0.12]),
+        (0.75, [0.95, 0.85, 0.08]),
+        (1.0, [0.95, 0.12, 0.08]),
+    ];
+    let mut i = 0;
+    while i + 1 < STOPS.len() && t > STOPS[i + 1].0 {
+        i += 1;
+    }
+    let (t0, c0) = STOPS[i];
+    let (t1, c1) = STOPS[(i + 1).min(STOPS.len() - 1)];
+    let u = if (t1 - t0).abs() < 1e-6 {
+        0.0
+    } else {
+        ((t - t0) / (t1 - t0)).clamp(0.0, 1.0)
+    };
+    [
+        c0[0] + (c1[0] - c0[0]) * u,
+        c0[1] + (c1[1] - c0[1]) * u,
+        c0[2] + (c1[2] - c0[2]) * u,
+        0.95,
+    ]
+}
+
+const WEIGHT_EPS: f32 = 0.001;
+/// Push overlay slightly along normals to avoid z-fight with the mesh.
+const WEIGHT_ZBIAS_FRAC: f32 = 0.012;
+
+fn rebuild_weight_overlay(scene: &Scene, rig: &RigDocument) -> Vec<(Vec3, Vec3, Vec3, [f32; 4])> {
+    let selected_keys: HashSet<(u32, u32)> =
+        rig.selected.iter().map(|b| b.node.key()).collect();
+    let zbias = (rig.average_bone_length(scene) * WEIGHT_ZBIAS_FRAC).clamp(0.0004, 0.02);
+
+    let skinned: Vec<(Handle<Node>, Handle<Mesh>, Handle<Skin>)> = scene
+        .nodes
+        .iter()
+        .filter_map(|(h, n)| match (n.mesh, n.skin) {
+            (Some(m), Some(s)) => Some((h, m, s)),
+            _ => None,
+        })
+        .collect();
+    if skinned.is_empty() {
+        return Vec::new();
+    }
+
+    let world = scene.world_matrices();
+    let mut out_tris: Vec<(Vec3, Vec3, Vec3, [f32; 4])> = Vec::new();
+
+    for (node_h, mesh_h, skin_h) in skinned {
+        let joint_keys: Vec<(u32, u32)> = {
+            let Some(skin) = scene.skins.get(skin_h) else {
+                continue;
+            };
+            skin.joints.iter().map(|j| j.key()).collect()
+        };
+        let mut joint_sel = vec![false; joint_keys.len()];
+        let mut any = false;
+        for (i, key) in joint_keys.iter().enumerate() {
+            if selected_keys.contains(key) {
+                joint_sel[i] = true;
+                any = true;
+            }
+        }
+        if !any {
+            continue;
+        }
+
+        let mats = scene.joint_matrices_with_cache(skin_h, node_h, &world);
+        if mats.is_empty() {
+            continue;
+        }
+        let mesh_world = world
+            .get(&node_h.key())
+            .copied()
+            .unwrap_or_else(|| scene.world_matrix(node_h));
+        let normal_world = mesh_world.inverse().transpose();
+
+        let Some(mesh) = scene.meshes.get(mesh_h) else {
+            continue;
+        };
+        let (Some(joints), Some(weights)) = (&mesh.joints, &mesh.weights) else {
+            continue;
+        };
+        let nverts = mesh
+            .positions
+            .len()
+            .min(joints.len())
+            .min(weights.len());
+        if nverts == 0 || mesh.indices.len() < 3 {
+            continue;
+        }
+
+        let mut w_sel = vec![0.0f32; nverts];
+        for i in 0..nverts {
+            let ji = joints[i];
+            let wi = weights[i];
+            let mut w_max = 0.0f32;
+            for k in 0..4 {
+                let idx = ji[k] as usize;
+                if idx < joint_sel.len() && joint_sel[idx] {
+                    w_max = w_max.max(wi[k]);
+                }
+            }
+            w_sel[i] = w_max;
+        }
+
+        let mut need = vec![false; nverts];
+        let mut influenced: Vec<[usize; 3]> = Vec::new();
+        for tri in mesh.indices.chunks_exact(3) {
+            let i0 = tri[0] as usize;
+            let i1 = tri[1] as usize;
+            let i2 = tri[2] as usize;
+            if i0 >= nverts || i1 >= nverts || i2 >= nverts {
+                continue;
+            }
+            let w = w_sel[i0].max(w_sel[i1]).max(w_sel[i2]);
+            if w < WEIGHT_EPS {
+                continue;
+            }
+            need[i0] = true;
+            need[i1] = true;
+            need[i2] = true;
+            influenced.push([i0, i1, i2]);
+        }
+        if influenced.is_empty() {
+            continue;
+        }
+
+        let mut pos_w = vec![Vec3::ZERO; nverts];
+        let mut nrm_w = vec![Vec3::Y; nverts];
+        for i in 0..nverts {
+            if !need[i] {
+                continue;
+            }
+            let ji = joints[i];
+            let wi = weights[i];
+            let p = Vec3::from_array(mesh.positions[i]);
+            let n = mesh
+                .normals
+                .get(i)
+                .map(|n| Vec3::from_array(*n))
+                .unwrap_or(Vec3::Y);
+            let mut skinned_p = Vec3::ZERO;
+            let mut skinned_n = Vec3::ZERO;
+            let mut w_sum = 0.0f32;
+            for k in 0..4 {
+                let idx = ji[k] as usize;
+                let w = wi[k];
+                if w <= 0.0 || idx >= mats.len() {
+                    continue;
+                }
+                skinned_p += mats[idx].transform_point3(p) * w;
+                skinned_n += mats[idx].transform_vector3(n) * w;
+                w_sum += w;
+            }
+            if w_sum < 1e-6 {
+                skinned_p = p;
+                skinned_n = n;
+            } else if (w_sum - 1.0).abs() > 1e-3 {
+                skinned_p /= w_sum;
+                skinned_n /= w_sum;
+            }
+            pos_w[i] = mesh_world.transform_point3(skinned_p);
+            let nw = normal_world.transform_vector3(skinned_n);
+            nrm_w[i] = if nw.length_squared() > 1e-10 {
+                nw.normalize()
+            } else {
+                Vec3::Y
+            };
+        }
+
+        out_tris.reserve(out_tris.len() + influenced.len());
+        for [i0, i1, i2] in influenced {
+            let w = w_sel[i0].max(w_sel[i1]).max(w_sel[i2]);
+            out_tris.push((
+                pos_w[i0] + nrm_w[i0] * zbias,
+                pos_w[i1] + nrm_w[i1] * zbias,
+                pos_w[i2] + nrm_w[i2] * zbias,
+                weight_heat(w),
+            ));
+        }
+    }
+
+    out_tris
+}
+
+/// Selected-bone weight influence as coloured tris (cached while idle).
+pub fn draw_weight_debug(scene: &mut Scene, rig: &mut RigDocument) {
+    if !rig.show_weights || rig.selected.is_empty() {
+        return;
+    }
+
+    if rig.weight_overlay.dirty {
+        rig.weight_overlay.tris = rebuild_weight_overlay(scene, rig);
+        rig.weight_overlay.dirty = false;
+    }
+
+    for &(a, b, c, color) in &rig.weight_overlay.tris {
+        scene.debug.tri(
+            a,
+            b,
+            c,
+            PolyOpts {
+                color,
+                depth_test: true,
+            },
+        );
+    }
+}
 
 /// Stick skeleton: thick outline + thinner fill, joint dots. Overlay so mesh never hides it.
 pub fn draw_rig_debug(scene: &mut Scene, rig: &RigDocument) {

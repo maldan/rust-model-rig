@@ -19,7 +19,7 @@ use winit::window::{Window, WindowId};
 
 use crate::app::{handle_tools, AppState, PointerFrame};
 use crate::gizmo;
-use crate::rig::{draw_rig_debug, Tool};
+use crate::rig::{draw_rig_debug, draw_weight_debug, Tool};
 
 /// Texture slot for the 3D viewport (`ui.texture(SCENE_TEX, …)`).
 pub const SCENE_TEX: u32 = 0;
@@ -699,6 +699,7 @@ impl<D: Demo> Host<D> {
                 [0.28, 0.28, 0.30, 0.28], // major — still muted
             );
             draw_rig_debug(&mut self.state.scene, &self.state.rig);
+            draw_weight_debug(&mut self.state.scene, &mut self.state.rig);
             if let (Some(sel), Some(pivot)) = (
                 self.state.rig.selection,
                 self.state.gizmo_pivot(),

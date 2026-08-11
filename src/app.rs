@@ -155,6 +155,7 @@ impl AppState {
         if let Some(n) = self.scene.nodes.get_mut(id.node) {
             n.local.rotation = q;
         }
+        self.rig.invalidate_weight_overlay();
         if self.rig.mode == AppMode::Edit {
             self.rig.write_bind_for(&self.scene, id);
         }
@@ -167,6 +168,7 @@ impl AppState {
         if let Some(n) = self.scene.nodes.get_mut(id.node) {
             n.local.translation = self.edit_translation;
         }
+        self.rig.invalidate_weight_overlay();
         if self.rig.mode == AppMode::Edit {
             self.rig.write_bind_for(&self.scene, id);
         }
@@ -269,6 +271,7 @@ pub fn handle_tools(state: &mut AppState, pointer: &PointerFrame, ui_wants_mouse
                 gizmo::apply_rotate(&mut state.scene, drag, rect, pointer.pos);
                 drag.bone
             };
+            state.rig.invalidate_weight_overlay();
             state.sync_inspector_live(bone);
         }
         return;
@@ -281,6 +284,7 @@ pub fn handle_tools(state: &mut AppState, pointer: &PointerFrame, ui_wants_mouse
                 gizmo::apply_translate(&mut state.scene, drag, rect, pointer.pos);
                 drag.bone
             };
+            state.rig.invalidate_weight_overlay();
             state.sync_inspector_live(bone);
         }
         return;
@@ -468,6 +472,7 @@ impl Demo for RigApp {
             ui.menu("View", |ui| {
                 let skel = ctx.state.rig.show_skeleton;
                 let mesh = ctx.state.rig.show_mesh;
+                let weights = ctx.state.rig.show_weights;
                 if ui
                     .menu_item(if skel {
                         "Hide Skeleton"
@@ -484,6 +489,17 @@ impl Demo for RigApp {
                 {
                     ctx.state.rig.show_mesh = !mesh;
                     ctx.state.rig.apply_mesh_visibility(&mut ctx.state.scene);
+                }
+                if ui
+                    .menu_item(if weights {
+                        "Hide Weights"
+                    } else {
+                        "Show Weights"
+                    })
+                    .clicked()
+                {
+                    ctx.state.rig.show_weights = !weights;
+                    ctx.state.rig.invalidate_weight_overlay();
                 }
             });
         });
