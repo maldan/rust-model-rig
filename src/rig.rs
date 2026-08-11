@@ -113,6 +113,36 @@ pub enum IkControlKind {
     Pole,
 }
 
+/// Secondary dynamics: gravity + spring-to-pose + support plane (hair / cloth / soft tissue).
+#[derive(Clone, Debug)]
+pub struct SoftChain {
+    pub id: u32,
+    pub name: String,
+    /// Fixed parent of `bones[0]` (follows body, not simulated).
+    pub anchor: BoneId,
+    /// Soft joints root→tip (linear). `bones[0]` is pinned to animated pose.
+    pub bones: Vec<BoneId>,
+    /// Rest length bones[i-1]→bones[i] (index 0 unused).
+    pub lengths: Vec<f32>,
+    /// Virtual particle past the tip (along tip +Y), so the last bone also swings.
+    pub tip_length: f32,
+    /// Support plane normal in `anchor` local space (points "out" of the body).
+    pub support_normal_local: Vec3,
+    pub enabled: bool,
+    /// World gravity acceleration (m/s²-ish in scene units).
+    pub gravity: f32,
+    /// Spring toward animated rest (1/s²).
+    pub stiffness: f32,
+    /// Velocity decay rate (1/s). Frame-rate independent.
+    pub damping: f32,
+    /// Radians from animated rest direction.
+    pub max_angle: f32,
+    /// Runtime Verlet state (world). Includes virtual tip as last particle.
+    pub(crate) prev_pos: Vec<Vec3>,
+    pub(crate) curr_pos: Vec<Vec3>,
+    pub(crate) initialized: bool,
+}
+
 #[derive(Clone)]
 struct WeightOverlayCache {
     dirty: bool,
@@ -158,11 +188,14 @@ pub struct RigDocument {
     pub transform_space: TransformSpace,
     /// Configured IK limbs (arms / legs).
     pub ik_chains: Vec<IkChain>,
+    /// Soft / secondary bone chains (gravity + support).
+    pub soft_chains: Vec<SoftChain>,
     /// Screen-space rect of the 3D viewport (updated each UI frame).
     pub viewport_rect: mega_ui::Rect,
     /// Counter for default bone names.
     next_bone_serial: u32,
     next_ik_serial: u32,
+    next_soft_serial: u32,
 }
 
 impl Default for RigDocument {
@@ -184,12 +217,14 @@ impl Default for RigDocument {
             move_mode: MoveMode::Fk,
             transform_space: TransformSpace::Local,
             ik_chains: Vec::new(),
+            soft_chains: Vec::new(),
             viewport_rect: mega_ui::Rect {
                 min: glam::Vec2::ZERO,
                 max: glam::Vec2::ZERO,
             },
             next_bone_serial: 1,
             next_ik_serial: 1,
+            next_soft_serial: 1,
         }
     }
 }
@@ -299,8 +334,10 @@ impl RigDocument {
         self.clear_selection();
         self.bind_locals.clear();
         self.ik_chains.clear();
+        self.soft_chains.clear();
         self.next_bone_serial = 1;
         self.next_ik_serial = 1;
+        self.next_soft_serial = 1;
         self.weight_overlay.clear();
     }
 
@@ -419,6 +456,11 @@ impl RigDocument {
             }
         }
         self.ik_chains = keep_chains;
+
+        self.soft_chains.retain(|c| {
+            !kill_set.contains(&c.anchor.node.key())
+                && !c.bones.iter().any(|b| kill_set.contains(&b.node.key()))
+        });
 
         // Detach from surviving parents' children lists.
         for b in &mut self.bones {
@@ -578,6 +620,118 @@ impl RigDocument {
     pub fn set_ik_enabled(&mut self, chain_id: u32, enabled: bool) {
         if let Some(c) = self.ik_chains.iter_mut().find(|c| c.id == chain_id) {
             c.enabled = enabled;
+        }
+    }
+
+    pub fn soft_chain_containing(&self, id: BoneId) -> Option<&SoftChain> {
+        self.soft_chains.iter().find(|c| c.bones.iter().any(|b| *b == id))
+    }
+
+    /// Soft chain from a selected bone: expands along the linear parent/child path.
+    /// Anchor = first branching (or multi-child) parent; needs ≥2 soft bones.
+    pub fn create_soft_from_bone(
+        &mut self,
+        scene: &Scene,
+        selected: BoneId,
+    ) -> Result<u32, &'static str> {
+        if self.ik_control_kind(selected).is_some() {
+            return Err("Cannot create Soft on an IK control bone");
+        }
+        if self.soft_chain_containing(selected).is_some() {
+            return Err("Bone already in a Soft chain");
+        }
+
+        let (anchor, bones) = collect_linear_soft_chain(self, selected)?;
+        if bones.len() < 2 {
+            return Err("Need at least 2 bones (root + tip). Extrude a child first");
+        }
+        if bones
+            .iter()
+            .any(|b| self.soft_chain_containing(*b).is_some())
+        {
+            return Err("Overlaps an existing Soft chain");
+        }
+
+        let mut lengths = Vec::with_capacity(bones.len());
+        lengths.push(0.0); // unused for pinned root
+        for i in 1..bones.len() {
+            let a = scene
+                .world_matrix(bones[i - 1].node)
+                .transform_point3(Vec3::ZERO);
+            let b = scene
+                .world_matrix(bones[i].node)
+                .transform_point3(Vec3::ZERO);
+            lengths.push((b - a).length().max(1e-3));
+        }
+        let tip_length = {
+            let avg = lengths.iter().skip(1).copied().sum::<f32>()
+                / (lengths.len() - 1).max(1) as f32;
+            avg.max(1e-3) * 0.65
+        };
+
+        let root_pos = scene
+            .world_matrix(bones[0].node)
+            .transform_point3(Vec3::ZERO);
+        let tip_pos = scene
+            .world_matrix(bones[bones.len() - 1].node)
+            .transform_point3(Vec3::ZERO);
+        let mut n_world = (tip_pos - root_pos).normalize_or_zero();
+        if n_world.length_squared() < 1e-8 {
+            let tip = bones[bones.len() - 1];
+            n_world = scene
+                .world_matrix(tip.node)
+                .transform_vector3(Vec3::Y)
+                .normalize_or_zero();
+        }
+        if n_world.length_squared() < 1e-8 {
+            n_world = Vec3::Z;
+        }
+        let anchor_rot = {
+            let m = scene.world_matrix(anchor.node);
+            let (_, r, _) = m.to_scale_rotation_translation();
+            r.normalize()
+        };
+        let support_normal_local = (anchor_rot.inverse() * n_world).normalize_or_zero();
+
+        let root_name = self
+            .bone(bones[0])
+            .map(|b| b.name.clone())
+            .unwrap_or_else(|| "Soft".into());
+        let n = bones.len();
+        let name = format!("Soft_{root_name}×{n}");
+
+        let id = self.next_soft_serial;
+        self.next_soft_serial += 1;
+        self.soft_chains.push(SoftChain {
+            id,
+            name,
+            anchor,
+            bones,
+            lengths,
+            tip_length,
+            support_normal_local,
+            enabled: true,
+            gravity: 18.0,
+            stiffness: 35.0,
+            damping: 6.0,
+            max_angle: 95f32.to_radians(),
+            prev_pos: Vec::new(),
+            curr_pos: Vec::new(),
+            initialized: false,
+        });
+        Ok(id)
+    }
+
+    pub fn remove_soft_chain(&mut self, chain_id: u32) {
+        self.soft_chains.retain(|c| c.id != chain_id);
+    }
+
+    pub fn set_soft_enabled(&mut self, chain_id: u32, enabled: bool) {
+        if let Some(c) = self.soft_chains.iter_mut().find(|c| c.id == chain_id) {
+            c.enabled = enabled;
+            if enabled {
+                c.initialized = false;
+            }
         }
     }
 
@@ -834,7 +988,14 @@ impl RigDocument {
                 }
             }
         }
+        self.reset_soft_sim();
         self.invalidate_weight_overlay();
+    }
+
+    pub fn reset_soft_sim(&mut self) {
+        for c in &mut self.soft_chains {
+            c.initialized = false;
+        }
     }
 
     pub fn reset_selected(&mut self, scene: &mut Scene) {
@@ -972,6 +1133,77 @@ impl RigDocument {
         }
         let sum: f32 = segs.iter().map(|(a, b, _)| (*b - *a).length()).sum();
         (sum / segs.len() as f32).max(0.05)
+    }
+}
+
+/// Soft chain = deepest path under `selected`, walking up to (but not including)
+/// the first multi-child / root parent — that parent is the fixed anchor.
+fn collect_linear_soft_chain(
+    rig: &RigDocument,
+    selected: BoneId,
+) -> Result<(BoneId, Vec<BoneId>), &'static str> {
+    if rig.bone(selected).is_none() {
+        return Err("Invalid bone");
+    }
+
+    let tip = deepest_descendant(rig, selected);
+
+    // Path tip → … → selected (and possibly above selected while single-child).
+    let mut bones_rev = vec![tip];
+    let mut cur = tip;
+    while cur != selected {
+        let Some(p) = rig.bone(cur).and_then(|b| b.parent) else {
+            return Err("Selection is not an ancestor of its tip path");
+        };
+        bones_rev.push(p);
+        cur = p;
+        if bones_rev.len() > 32 {
+            return Err("Soft chain too long");
+        }
+    }
+
+    // Continue upward through a linear run so soft root sits under a branch/anchor.
+    loop {
+        let Some(p) = rig.bone(cur).and_then(|b| b.parent) else {
+            return Err("Soft chain needs a parent anchor");
+        };
+        let p_child_count = rig.bone(p).map(|b| b.children.len()).unwrap_or(0);
+        if p_child_count != 1 {
+            bones_rev.reverse();
+            return Ok((p, bones_rev));
+        }
+        bones_rev.push(p);
+        cur = p;
+        if bones_rev.len() > 32 {
+            return Err("Soft chain too long");
+        }
+    }
+}
+
+fn chain_depth(rig: &RigDocument, id: BoneId) -> usize {
+    let kids = rig.bone(id).map(|b| b.children.clone()).unwrap_or_default();
+    if kids.is_empty() {
+        return 1;
+    }
+    1 + kids
+        .into_iter()
+        .map(|c| chain_depth(rig, c))
+        .max()
+        .unwrap_or(0)
+}
+
+fn deepest_descendant(rig: &RigDocument, id: BoneId) -> BoneId {
+    let kids = rig.bone(id).map(|b| b.children.clone()).unwrap_or_default();
+    match kids.len() {
+        0 => id,
+        1 => deepest_descendant(rig, kids[0]),
+        _ => {
+            let best = kids
+                .into_iter()
+                .max_by_key(|c| chain_depth(rig, *c))
+                .unwrap();
+            deepest_descendant(rig, best)
+        }
     }
 }
 

@@ -770,6 +770,8 @@ fn bone_panel(ui: &mut Ui, state: &mut AppState) {
     ui.separator();
     ik_chains_section(ui, state);
     ui.separator();
+    soft_chains_section(ui, state);
+    ui.separator();
 
     let avail = ui.available_size();
     let roots = state.rig.roots();
@@ -858,6 +860,61 @@ fn ik_chains_section(ui: &mut Ui, state: &mut AppState) {
             }
             if ui.button("X").clicked() {
                 state.rig.remove_ik_chain(&mut state.scene, id);
+                state.clear_drags();
+                state.edit_bone = None;
+                state.status = format!("Removed {name}");
+            }
+        });
+    }
+}
+
+fn soft_chains_section(ui: &mut Ui, state: &mut AppState) {
+    ui.label_styled(
+        &format!("Soft Chains ({})", state.rig.soft_chains.len()),
+        TextStyle {
+            color: [0.9, 0.9, 0.9, 1.0],
+            size: 13.0,
+        },
+    );
+
+    if state.rig.soft_chains.is_empty() {
+        ui.label("Select bone → Create Soft (auto parent/children)");
+        return;
+    }
+
+    let chains: Vec<(u32, String, bool)> = state
+        .rig
+        .soft_chains
+        .iter()
+        .map(|c| (c.id, c.name.clone(), c.enabled))
+        .collect();
+
+    for (id, name, enabled) in chains {
+        ui.horizontal(|ui| {
+            let label = if enabled {
+                format!("● {name}")
+            } else {
+                format!("○ {name}")
+            };
+            if ui.button(&label).clicked() {
+                state.rig.set_soft_enabled(id, !enabled);
+                state.status = if !enabled {
+                    format!("{name} enabled")
+                } else {
+                    format!("{name} muted")
+                };
+            }
+            if ui.button("Sel").clicked() {
+                if let Some(c) = state.rig.soft_chains.iter().find(|c| c.id == id) {
+                    if let Some(&b) = c.bones.first() {
+                        state.rig.set_selection(b);
+                        state.edit_bone = None;
+                        state.status_from_selection();
+                    }
+                }
+            }
+            if ui.button("X").clicked() {
+                state.rig.remove_soft_chain(id);
                 state.clear_drags();
                 state.edit_bone = None;
                 state.status = format!("Removed {name}");
@@ -978,6 +1035,61 @@ fn inspector_panel(ui: &mut Ui, state: &mut AppState) {
                         state.status = format!(
                             "IK ×{len} · Move target, Rotate target = hand, Pole = elbow"
                         );
+                    }
+                    Err(e) => {
+                        state.status = e.into();
+                    }
+                }
+            }
+            ui.separator();
+        }
+    }
+
+    // Soft setup / params
+    {
+        let soft_id = state.rig.soft_chain_containing(sel).map(|c| c.id);
+        let is_control = state.rig.ik_control_kind(sel).is_some();
+        if let Some(cid) = soft_id {
+            ui.label("Soft chain on this bone");
+            if let Some(c) = state.rig.soft_chains.iter_mut().find(|c| c.id == cid) {
+                ui.label("Gravity (m/s²)");
+                if ui
+                    .slider(&format!("soft_g_{cid}"), &mut c.gravity, 0.0..=80.0)
+                    .changed()
+                {
+                    c.initialized = false;
+                }
+                ui.label("Stiffness");
+                let _ = ui.slider(&format!("soft_k_{cid}"), &mut c.stiffness, 0.0..=200.0);
+                ui.label("Damping (1/s)");
+                let _ = ui.slider(&format!("soft_d_{cid}"), &mut c.damping, 0.0..=40.0);
+                ui.label("Max angle (°)");
+                let mut deg = c.max_angle.to_degrees();
+                if ui
+                    .slider(&format!("soft_a_{cid}"), &mut deg, 5.0..=170.0)
+                    .changed()
+                {
+                    c.max_angle = deg.to_radians();
+                }
+            }
+            if ui.button("Remove Soft").clicked() {
+                state.rig.remove_soft_chain(cid);
+                state.clear_drags();
+                state.edit_bone = None;
+                state.status = "Soft removed".into();
+            }
+            ui.separator();
+        } else if !is_control {
+            ui.label("Soft: select any bone in a linear chain");
+            if ui.button("Create Soft").clicked() {
+                match state.rig.create_soft_from_bone(&state.scene, sel) {
+                    Ok(_) => {
+                        state.edit_bone = None;
+                        if state.rig.mode != AppMode::Pose {
+                            state.set_mode(AppMode::Pose);
+                        }
+                        state.status =
+                            "Soft created · Pose mode: gravity + support plane".into();
                     }
                     Err(e) => {
                         state.status = e.into();

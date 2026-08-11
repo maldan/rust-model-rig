@@ -21,6 +21,7 @@ use crate::app::{handle_tools, AppState, PointerFrame};
 use crate::gizmo;
 use crate::ik_chain::{draw_ik_helpers, evaluate_ik_chains};
 use crate::rig::{draw_rig_debug, draw_weight_debug, Tool};
+use crate::soft_chain::{draw_soft_helpers, evaluate_soft_chains};
 
 /// Texture slot for the 3D viewport (`ui.texture(SCENE_TEX, …)`).
 pub const SCENE_TEX: u32 = 0;
@@ -691,6 +692,8 @@ impl<D: Demo> Host<D> {
 
             // Pose IK: solve after tools so targets moved this frame apply.
             evaluate_ik_chains(&mut self.state.scene, &self.state.rig);
+            // Soft chains: after IK so they inherit body / limb motion.
+            evaluate_soft_chains(&mut self.state.scene, &mut self.state.rig, dt);
 
             // Debug / gizmo after tools so pose matches this frame.
             self.state.scene.debug.clear();
@@ -704,6 +707,7 @@ impl<D: Demo> Host<D> {
             );
             draw_rig_debug(&mut self.state.scene, &self.state.rig);
             draw_ik_helpers(&mut self.state.scene, &self.state.rig);
+            draw_soft_helpers(&mut self.state.scene, &self.state.rig);
             draw_weight_debug(&mut self.state.scene, &mut self.state.rig);
             if let (Some(sel), Some(pivot)) = (
                 self.state.rig.selection,

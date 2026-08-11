@@ -4,6 +4,7 @@ mod gizmo;
 mod ik;
 mod ik_chain;
 mod pick;
+mod soft_chain;
 mod rig;
 mod verlet;
 
