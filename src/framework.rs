@@ -587,6 +587,13 @@ impl<D: Demo> Host<D> {
             self.state.resync_camera = false;
         }
 
+        if self.state.clear_gpu_cache {
+            if let Some(gpu) = self.gpu.as_mut() {
+                gpu.visualizer.clear_scene_gpu_cache();
+            }
+            self.state.clear_gpu_cache = false;
+        }
+
         let scroll = self.input.scroll_delta.y;
         if scroll.abs() > 0.0
             && !self.state.has_drag()

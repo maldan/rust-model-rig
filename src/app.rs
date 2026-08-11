@@ -29,6 +29,8 @@ pub struct AppState {
     pub edit_bone: Option<BoneId>,
     /// Host should re-read orbit cam from `scene.camera`.
     pub resync_camera: bool,
+    /// Host should drop visualizer mesh/texture GPU caches (after Scene replace).
+    pub clear_gpu_cache: bool,
     /// Bones that rotate when creating IK (tip's ancestors). Default 2 = arm/leg.
     pub ik_create_length: usize,
 }
@@ -56,6 +58,7 @@ impl AppState {
             edit_translation: Vec3::ZERO,
             edit_bone: None,
             resync_camera: false,
+            clear_gpu_cache: false,
             ik_create_length: 2,
         }
     }
@@ -74,6 +77,18 @@ impl AppState {
         self.ik_drag = None;
         self.verlet_drag = None;
         self.marquee = None;
+    }
+
+    /// Wipe interaction / inspector state after replacing the document or scene.
+    pub fn reset_session_state(&mut self) {
+        self.clear_drags();
+        self.gizmo_hover = None;
+        self.edit_bone = None;
+        self.edit_euler_deg = Vec3::ZERO;
+        self.edit_translation = Vec3::ZERO;
+        self.ik_create_length = 2;
+        self.resync_camera = true;
+        self.clear_gpu_cache = true;
     }
 
     fn status_from_selection(&mut self) {
@@ -104,10 +119,7 @@ impl AppState {
             Ok(()) => {
                 // Pose editor: strip clips so nothing overwrites FK.
                 self.scene.animators.clear();
-                self.clear_drags();
-                self.gizmo_hover = None;
-                self.edit_bone = None;
-                self.resync_camera = true;
+                self.reset_session_state();
                 let with_parent = self.rig.bones.iter().filter(|b| b.parent.is_some()).count();
                 self.status = format!(
                     "Loaded {} · {} bones ({} with parent) · Pose mode",
@@ -126,10 +138,7 @@ impl AppState {
 
     pub fn new_skeleton(&mut self) {
         self.rig.new_skeleton(&mut self.scene);
-        self.clear_drags();
-        self.gizmo_hover = None;
-        self.edit_bone = None;
-        self.resync_camera = true;
+        self.reset_session_state();
         self.status = "New skeleton · Edit mode · Extrude (E) / Add / Translate".into();
     }
 
@@ -957,6 +966,13 @@ fn inspector_panel(ui: &mut Ui, state: &mut AppState) {
     );
     ui.separator();
 
+    let avail = ui.available_size();
+    ui.scroll_area("inspector_scroll", avail, ScrollAxes::Vertical, |ui| {
+        inspector_panel_body(ui, state);
+    });
+}
+
+fn inspector_panel_body(ui: &mut Ui, state: &mut AppState) {
     let Some(sel) = state.rig.selection else {
         ui.label("Nothing selected.");
         return;
@@ -1054,12 +1070,12 @@ fn inspector_panel(ui: &mut Ui, state: &mut AppState) {
             if let Some(c) = state.rig.soft_chains.iter_mut().find(|c| c.id == cid) {
                 ui.label("Gravity (m/s²)");
                 if ui
-                    .slider(&format!("soft_g_{cid}"), &mut c.gravity, 0.0..=80.0)
+                    .slider(&format!("soft_g_{cid}"), &mut c.gravity, 0.0..=40.0)
                     .changed()
                 {
                     c.initialized = false;
                 }
-                ui.label("Stiffness");
+                ui.label("Stiffness (1/s²)");
                 let _ = ui.slider(&format!("soft_k_{cid}"), &mut c.stiffness, 0.0..=200.0);
                 ui.label("Damping (1/s)");
                 let _ = ui.slider(&format!("soft_d_{cid}"), &mut c.damping, 0.0..=40.0);

@@ -131,7 +131,7 @@ pub struct SoftChain {
     pub enabled: bool,
     /// World gravity acceleration (m/s²-ish in scene units).
     pub gravity: f32,
-    /// Spring toward animated rest (1/s²).
+    /// Spring accel toward animated rest (1/s²). Sag ≈ gravity / stiffness.
     pub stiffness: f32,
     /// Velocity decay rate (1/s). Frame-rate independent.
     pub damping: f32,
@@ -140,6 +140,8 @@ pub struct SoftChain {
     /// Runtime Verlet state (world). Includes virtual tip as last particle.
     pub(crate) prev_pos: Vec<Vec3>,
     pub(crate) curr_pos: Vec<Vec3>,
+    /// Previous frame world matrix of soft root (`bones[0]`) for motion inheritance.
+    pub(crate) prev_root_world: glam::Mat4,
     pub(crate) initialized: bool,
 }
 
@@ -339,6 +341,9 @@ impl RigDocument {
         self.next_ik_serial = 1;
         self.next_soft_serial = 1;
         self.weight_overlay.clear();
+        self.show_weights = false;
+        self.move_mode = MoveMode::Fk;
+        self.transform_space = TransformSpace::Local;
     }
 
     /// Empty scene + root bone (+ tip child so a segment is visible).
@@ -711,12 +716,13 @@ impl RigDocument {
             tip_length,
             support_normal_local,
             enabled: true,
-            gravity: 18.0,
-            stiffness: 35.0,
+            gravity: 9.8,
+            stiffness: 45.0,
             damping: 6.0,
             max_angle: 95f32.to_radians(),
             prev_pos: Vec::new(),
             curr_pos: Vec::new(),
+            prev_root_world: glam::Mat4::IDENTITY,
             initialized: false,
         });
         Ok(id)
