@@ -156,3 +156,26 @@ pub fn project_world_to_screen(scene: &Scene, viewport: Rect, world: Vec3) -> Op
     let y = viewport.min.y + (1.0 - (ndc.y * 0.5 + 0.5)) * h;
     Some(Vec2::new(x, y))
 }
+
+/// Bones whose joints fall inside a screen-space axis-aligned rect.
+pub fn bones_in_screen_rect(
+    scene: &Scene,
+    rig: &RigDocument,
+    viewport: Rect,
+    min: Vec2,
+    max: Vec2,
+) -> Vec<BoneId> {
+    let lo = Vec2::new(min.x.min(max.x), min.y.min(max.y));
+    let hi = Vec2::new(min.x.max(max.x), min.y.max(max.y));
+    let mut out = Vec::new();
+    for b in &rig.bones {
+        let world = scene.world_matrix(b.id.node).transform_point3(Vec3::ZERO);
+        let Some(screen) = project_world_to_screen(scene, viewport, world) else {
+            continue;
+        };
+        if screen.x >= lo.x && screen.x <= hi.x && screen.y >= lo.y && screen.y <= hi.y {
+            out.push(b.id);
+        }
+    }
+    out
+}

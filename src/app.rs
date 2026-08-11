@@ -15,6 +15,7 @@ pub struct AppState {
     pub status: String,
     pub rotate_drag: Option<RotateDrag>,
     pub translate_drag: Option<TranslateDrag>,
+    pub marquee: Option<MarqueeDrag>,
     pub gizmo_hover: Option<GizmoAxis>,
     /// Euler degrees shown in inspector (synced from selection).
     pub edit_euler_deg: Vec3,
@@ -22,6 +23,13 @@ pub struct AppState {
     pub edit_bone: Option<BoneId>,
     /// Host should re-read orbit cam from `scene.camera`.
     pub resync_camera: bool,
+}
+
+#[derive(Clone, Copy)]
+pub struct MarqueeDrag {
+    pub start: Vec2,
+    pub current: Vec2,
+    pub additive: bool,
 }
 
 impl AppState {
@@ -32,6 +40,7 @@ impl AppState {
             status: "File → New Skeleton · Tab switches Edit/Pose".into(),
             rotate_drag: None,
             translate_drag: None,
+            marquee: None,
             gizmo_hover: None,
             edit_euler_deg: Vec3::ZERO,
             edit_translation: Vec3::ZERO,
@@ -41,12 +50,30 @@ impl AppState {
     }
 
     pub fn has_drag(&self) -> bool {
-        self.rotate_drag.is_some() || self.translate_drag.is_some()
+        self.rotate_drag.is_some() || self.translate_drag.is_some() || self.marquee.is_some()
     }
 
     pub fn clear_drags(&mut self) {
         self.rotate_drag = None;
         self.translate_drag = None;
+        self.marquee = None;
+    }
+
+    fn status_from_selection(&mut self) {
+        let n = self.rig.selected.len();
+        self.status = match n {
+            0 => "Selection cleared.".into(),
+            1 => {
+                let id = self.rig.selection.unwrap();
+                let name = self
+                    .rig
+                    .bone(id)
+                    .map(|b| b.name.clone())
+                    .unwrap_or_else(|| "?".into());
+                format!("Selected: {name}")
+            }
+            _ => format!("Selected: {n} bones"),
+        };
     }
 
     pub fn open_dialog(&mut self) {
@@ -146,10 +173,14 @@ impl AppState {
     }
 
     pub fn gizmo_radius(&self) -> f32 {
-        let Some(sel) = self.rig.selection else {
+        let Some(pivot) = self.rig.selection_pivot(&self.scene) else {
             return 0.15;
         };
-        gizmo::gizmo_radius(&self.scene, sel, self.rig.viewport_rect.height())
+        gizmo::gizmo_radius_at(&self.scene, pivot, self.rig.viewport_rect.height())
+    }
+
+    pub fn gizmo_pivot(&self) -> Option<Vec3> {
+        self.rig.selection_pivot(&self.scene)
     }
 
     fn sync_inspector_live(&mut self, bone: BoneId) {
@@ -167,7 +198,10 @@ pub struct PointerFrame {
     pub pressed: bool,
     pub down: bool,
     pub released: bool,
+    pub ctrl: bool,
 }
+
+const MARQUEE_CLICK_PX: f32 = 5.0;
 
 /// Viewport select / gizmo after UI laid out `viewport_rect`.
 pub fn handle_tools(state: &mut AppState, pointer: &PointerFrame, ui_wants_mouse: bool) {
@@ -175,30 +209,53 @@ pub fn handle_tools(state: &mut AppState, pointer: &PointerFrame, ui_wants_mouse
     let over = rect.width() > 1.0 && rect.height() > 1.0 && rect.contains(pointer.pos);
 
     if pointer.released {
+        if let Some(m) = state.marquee.take() {
+            finish_marquee(state, rect, m);
+        }
         // Commit bind on edit transforms when drag ends.
         if state.rig.mode == AppMode::Edit {
-            if let Some(d) = state.rotate_drag {
-                state.rig.write_bind_for(&state.scene, d.bone);
+            if let Some(d) = state.rotate_drag.take() {
+                for &(bone, _, _, _) in &d.bones {
+                    state.rig.write_bind_for(&state.scene, bone);
+                }
             }
-            if let Some(d) = state.translate_drag {
-                state.rig.write_bind_for(&state.scene, d.bone);
+            if let Some(d) = state.translate_drag.take() {
+                for &(bone, _, _) in &d.bones {
+                    state.rig.write_bind_for(&state.scene, bone);
+                }
             }
         }
         state.clear_drags();
     }
 
+    // Update marquee while dragging.
+    if let Some(ref mut m) = state.marquee {
+        if pointer.down {
+            m.current = pointer.pos;
+        }
+        return;
+    }
+
     // Hover gizmo handles.
     state.gizmo_hover = None;
     if over && state.rig.selection.is_some() && !state.has_drag() {
-        let sel = state.rig.selection.unwrap();
-        let radius = state.gizmo_radius();
-        state.gizmo_hover = match state.rig.tool {
-            Tool::Rotate => gizmo::hover_axis(&state.scene, sel, rect, pointer.pos, radius),
-            Tool::Translate => {
-                gizmo::hover_translate_axis(&state.scene, sel, rect, pointer.pos, radius)
-            }
-            _ => None,
-        };
+        if let (Some(sel), Some(pivot)) = (state.rig.selection, state.gizmo_pivot()) {
+            let radius = state.gizmo_radius();
+            state.gizmo_hover = match state.rig.tool {
+                Tool::Rotate => {
+                    gizmo::hover_axis(&state.scene, sel, pivot, rect, pointer.pos, radius)
+                }
+                Tool::Translate => gizmo::hover_translate_axis(
+                    &state.scene,
+                    sel,
+                    pivot,
+                    rect,
+                    pointer.pos,
+                    radius,
+                ),
+                _ => None,
+            };
+        }
     } else if let Some(ref drag) = state.rotate_drag {
         state.gizmo_hover = Some(drag.axis);
     } else if let Some(ref drag) = state.translate_drag {
@@ -233,28 +290,41 @@ pub fn handle_tools(state: &mut AppState, pointer: &PointerFrame, ui_wants_mouse
         return;
     }
 
-    // Gizmo grab first.
-    if let Some(sel) = state.rig.selection {
+    let roots = state.rig.selection_roots();
+
+    // Gizmo grab first — only selection roots transform; children follow FK.
+    if let (Some(sel), Some(pivot)) = (state.rig.selection, state.gizmo_pivot()) {
         let radius = state.gizmo_radius();
         match state.rig.tool {
             Tool::Rotate => {
-                if let Some(drag) =
-                    gizmo::begin_rotate(&state.scene, sel, rect, pointer.pos, radius)
-                {
+                if let Some(drag) = gizmo::begin_rotate(
+                    &state.scene,
+                    sel,
+                    &roots,
+                    pivot,
+                    rect,
+                    pointer.pos,
+                    radius,
+                ) {
                     state.rotate_drag = Some(drag);
                     return;
                 }
             }
             Tool::Translate => {
-                if let Some(drag) =
-                    gizmo::begin_translate(&state.scene, sel, rect, pointer.pos, radius)
-                {
+                if let Some(drag) = gizmo::begin_translate(
+                    &state.scene,
+                    sel,
+                    &roots,
+                    pivot,
+                    rect,
+                    pointer.pos,
+                    radius,
+                ) {
                     state.translate_drag = Some(drag);
                     return;
                 }
             }
             Tool::AddBone => {
-                // Click: extrude from selection, or place new root on ground.
                 if let Some(parent) = state.rig.selection {
                     if state.rig.extrude_bone(&mut state.scene, parent).is_some() {
                         state.edit_bone = None;
@@ -278,20 +348,47 @@ pub fn handle_tools(state: &mut AppState, pointer: &PointerFrame, ui_wants_mouse
         return;
     }
 
-    // Pick bone.
+    // Ctrl+drag: marquee (additive). Plain click: pick / clear.
+    if pointer.ctrl && state.rig.tool != Tool::AddBone {
+        state.marquee = Some(MarqueeDrag {
+            start: pointer.pos,
+            current: pointer.pos,
+            additive: true,
+        });
+        return;
+    }
+
     let Some(ray) = pick::ray_from_viewport(&state.scene, rect, pointer.pos) else {
         return;
     };
     if let Some(id) = pick::pick_bone(&state.scene, &state.rig, &ray) {
-        state.rig.selection = Some(id);
+        state.rig.set_selection(id);
         state.edit_bone = None;
-        if let Some(name) = state.rig.bone(id).map(|b| b.name.clone()) {
-            state.status = format!("Selected: {name}");
-        }
+        state.status_from_selection();
     } else if state.gizmo_hover.is_none() {
-        state.rig.selection = None;
+        state.rig.clear_selection();
         state.edit_bone = None;
+        state.status_from_selection();
     }
+}
+
+fn finish_marquee(state: &mut AppState, viewport: mega_ui::Rect, m: MarqueeDrag) {
+    let drag_len = (m.current - m.start).length();
+    state.edit_bone = None;
+
+    if drag_len < MARQUEE_CLICK_PX {
+        if let Some(ray) = pick::ray_from_viewport(&state.scene, viewport, m.start) {
+            if let Some(id) = pick::pick_bone(&state.scene, &state.rig, &ray) {
+                state.rig.toggle_selection(id);
+                state.status_from_selection();
+            }
+        }
+        return;
+    }
+
+    let ids = pick::bones_in_screen_rect(&state.scene, &state.rig, viewport, m.start, m.current);
+    state.rig.select_bones(&ids, m.additive);
+    state.status_from_selection();
 }
 
 pub fn default_dock() -> DockState {
@@ -471,17 +568,18 @@ fn viewport_toolbar(ui: &mut Ui, state: &mut AppState) {
             }
             AppMode::Pose => {
                 let mut tool_i = match state.rig.tool {
-                    Tool::Rotate => 1,
+                    Tool::Translate => 1,
+                    Tool::Rotate => 2,
                     _ => 0,
                 };
                 if ui
-                    .toggle("tool_pose", &mut tool_i, &["Select", "Rotate"])
+                    .toggle("tool_pose", &mut tool_i, &["Select", "Move", "Rotate"])
                     .changed()
                 {
-                    state.rig.tool = if tool_i == 1 {
-                        Tool::Rotate
-                    } else {
-                        Tool::Select
+                    state.rig.tool = match tool_i {
+                        1 => Tool::Translate,
+                        2 => Tool::Rotate,
+                        _ => Tool::Select,
                     };
                     state.clear_drags();
                 }
@@ -491,11 +589,12 @@ fn viewport_toolbar(ui: &mut Ui, state: &mut AppState) {
 
     let hint = match (state.rig.mode, state.rig.tool) {
         (AppMode::Edit, Tool::AddBone) => "Click bone to extrude · empty click places root",
-        (AppMode::Edit, Tool::Translate) => "Drag arrows to move · E extrude · Del delete",
-        (AppMode::Edit, Tool::Rotate) => "Drag rings to rotate rest pose",
-        (AppMode::Edit, _) => "Select a bone · E extrude · Tab → Pose",
-        (AppMode::Pose, Tool::Rotate) => "Drag rings to pose · Reset in Inspector",
-        (AppMode::Pose, _) => "Select a bone · R rotate · Tab → Edit",
+        (AppMode::Edit, Tool::Translate) => "Drag arrows · Ctrl+drag box select · E extrude",
+        (AppMode::Edit, Tool::Rotate) => "Drag rings · Ctrl+drag box select",
+        (AppMode::Edit, _) => "Select · Ctrl+drag box · Ctrl+click toggle · Tab → Pose",
+        (AppMode::Pose, Tool::Translate) => "Drag arrows · Ctrl+drag box select",
+        (AppMode::Pose, Tool::Rotate) => "Drag rings · Ctrl+drag box select",
+        (AppMode::Pose, _) => "Select · Ctrl+drag box · Ctrl+click toggle · Tab → Edit",
     };
     ui.label_styled(
         hint,
@@ -567,12 +666,14 @@ fn bone_panel(ui: &mut Ui, state: &mut AppState) {
             .map(|b| b.id)
     });
     if new_sel != prev {
-        state.rig.selection = new_sel;
-        state.edit_bone = None;
         if let Some(id) = new_sel {
-            if let Some(name) = state.rig.bone(id).map(|b| b.name.clone()) {
-                state.status = format!("Selected: {name}");
-            }
+            state.rig.set_selection(id);
+            state.edit_bone = None;
+            state.status_from_selection();
+        } else {
+            state.rig.clear_selection();
+            state.edit_bone = None;
+            state.status_from_selection();
         }
     }
 }
@@ -615,6 +716,10 @@ fn inspector_panel(ui: &mut Ui, state: &mut AppState) {
         ui.label("Nothing selected.");
         return;
     };
+    let n_sel = state.rig.selected.len();
+    if n_sel > 1 {
+        ui.label(&format!("{n_sel} bones selected · editing active"));
+    }
     let (name, deform, parent_name) = {
         let Some(b) = state.rig.bone(sel) else {
             ui.label("Invalid selection.");

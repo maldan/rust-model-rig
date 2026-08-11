@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use glam::{Vec2, Vec3};
 use mega_render::{
-    view_gizmo, Camera, DebugView, InputFrame, PostProcessSettings, Projection, Scene,
+    view_gizmo, Camera, DebugView, HudRect, InputFrame, PostProcessSettings, Projection, Scene,
     ShadowSettings, Visualizer, WgpuVisualizer,
 };
 use mega_ui::wgpu::{DrawStats, UiRenderer};
@@ -681,6 +681,7 @@ impl<D: Demo> Host<D> {
                             pressed: self.input.mouse_pressed && !over_view_gizmo,
                             down: self.input.mouse_down,
                             released: self.input.mouse_released,
+                            ctrl: self.input.shortcut_mod(),
                         },
                         out.want_capture_mouse && !vp_rect.contains(mouse),
                     );
@@ -698,13 +699,17 @@ impl<D: Demo> Host<D> {
                 [0.28, 0.28, 0.30, 0.28], // major — still muted
             );
             draw_rig_debug(&mut self.state.scene, &self.state.rig);
-            if let Some(sel) = self.state.rig.selection {
+            if let (Some(sel), Some(pivot)) = (
+                self.state.rig.selection,
+                self.state.gizmo_pivot(),
+            ) {
                 let radius = self.state.gizmo_radius();
                 match self.state.rig.tool {
                     Tool::Rotate => {
                         gizmo::draw_rotate_gizmo(
                             &mut self.state.scene,
                             sel,
+                            pivot,
                             radius,
                             self.state.gizmo_hover,
                             self.state.rotate_drag.as_ref(),
@@ -714,6 +719,7 @@ impl<D: Demo> Host<D> {
                         gizmo::draw_translate_gizmo(
                             &mut self.state.scene,
                             sel,
+                            pivot,
                             radius,
                             self.state.gizmo_hover,
                             self.state.translate_drag.as_ref(),
@@ -746,6 +752,25 @@ impl<D: Demo> Host<D> {
                     vp_size,
                     local,
                 );
+                if let Some(m) = &self.state.marquee {
+                    let a = m.start - vp_rect.min;
+                    let b = m.current - vp_rect.min;
+                    let min = Vec2::new(a.x.min(b.x), a.y.min(b.y));
+                    let max = Vec2::new(a.x.max(b.x), a.y.max(b.y));
+                    let r = HudRect { min, max };
+                    self.state
+                        .scene
+                        .hud
+                        .fill(r, [0.25, 0.55, 1.0, 0.18]);
+                    let c = [0.45, 0.75, 1.0, 0.95];
+                    let corners = [
+                        Vec2::new(min.x, min.y),
+                        Vec2::new(max.x, min.y),
+                        Vec2::new(max.x, max.y),
+                        Vec2::new(min.x, max.y),
+                    ];
+                    self.state.scene.hud.polyline(&corners, c, true);
+                }
                 let _ = self.state.scene.hud.end();
             }
 
@@ -979,8 +1004,8 @@ impl<D: Demo> ApplicationHandler for Host<D> {
                 let down = event.state == ElementState::Pressed;
                 if let PhysicalKey::Code(code) = event.physical_key {
                     if down && code == KeyCode::Escape {
-                        if self.state.rig.selection.is_some() || self.state.has_drag() {
-                            self.state.rig.selection = None;
+                        if !self.state.rig.selected.is_empty() || self.state.has_drag() {
+                            self.state.rig.clear_selection();
                             self.state.clear_drags();
                             self.state.edit_bone = None;
                             self.state.status = "Selection cleared.".into();
@@ -1003,11 +1028,9 @@ impl<D: Demo> ApplicationHandler for Host<D> {
                                 self.state.status = "Tool: Rotate".into();
                             }
                             KeyCode::KeyG | KeyCode::Digit2 => {
-                                if self.state.rig.mode == crate::rig::AppMode::Edit {
-                                    self.state.rig.tool = crate::rig::Tool::Translate;
-                                    self.state.clear_drags();
-                                    self.state.status = "Tool: Move".into();
-                                }
+                                self.state.rig.tool = crate::rig::Tool::Translate;
+                                self.state.clear_drags();
+                                self.state.status = "Tool: Move".into();
                             }
                             KeyCode::KeyA => {
                                 if self.state.rig.mode == crate::rig::AppMode::Edit {

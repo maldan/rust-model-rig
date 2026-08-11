@@ -72,7 +72,10 @@ pub struct RigDocument {
     pub model_root: Option<Handle<Node>>,
     pub bones: Vec<BoneInfo>,
     pub bone_index: HashMap<(u32, u32), usize>,
+    /// Active bone (gizmo / inspector). Always ∈ `selected` when `Some`.
     pub selection: Option<BoneId>,
+    /// Multi-selection set.
+    pub selected: HashSet<BoneId>,
     /// Local transforms at bind (load) time.
     pub bind_locals: HashMap<(u32, u32), Transform>,
     pub show_skeleton: bool,
@@ -93,6 +96,7 @@ impl Default for RigDocument {
             bones: Vec::new(),
             bone_index: HashMap::new(),
             selection: None,
+            selected: HashSet::new(),
             bind_locals: HashMap::new(),
             show_skeleton: true,
             show_mesh: true,
@@ -108,6 +112,91 @@ impl Default for RigDocument {
 }
 
 impl RigDocument {
+    pub fn clear_selection(&mut self) {
+        self.selected.clear();
+        self.selection = None;
+    }
+
+    pub fn set_selection(&mut self, id: BoneId) {
+        self.selected.clear();
+        self.selected.insert(id);
+        self.selection = Some(id);
+    }
+
+    pub fn toggle_selection(&mut self, id: BoneId) {
+        if self.selected.contains(&id) {
+            self.selected.remove(&id);
+            if self.selection == Some(id) {
+                self.selection = self.selected.iter().copied().next();
+            }
+        } else {
+            self.selected.insert(id);
+            self.selection = Some(id);
+        }
+    }
+
+    /// Replace or union selection with `ids`. Active = last id (if any).
+    pub fn select_bones(&mut self, ids: &[BoneId], additive: bool) {
+        if !additive {
+            self.selected.clear();
+            self.selection = None;
+        }
+        for &id in ids {
+            self.selected.insert(id);
+        }
+        if let Some(&last) = ids.last() {
+            self.selection = Some(last);
+        }
+    }
+
+    pub fn is_selected(&self, id: BoneId) -> bool {
+        self.selected.contains(&id)
+    }
+
+    pub fn selected_bones(&self) -> Vec<BoneId> {
+        let mut out: Vec<_> = self.selected.iter().copied().collect();
+        // Active first, then by node index.
+        if let Some(active) = self.selection {
+            out.sort_by_key(|id| (*id != active, id.node.index, id.node.generation));
+        } else {
+            out.sort_by_key(|id| (id.node.index, id.node.generation));
+        }
+        out
+    }
+
+    /// Bones in the selection whose parent is not selected (Blender-style transform targets).
+    /// Children stay selected for highlight but follow via FK.
+    pub fn selection_roots(&self) -> Vec<BoneId> {
+        let mut roots: Vec<_> = self
+            .selected
+            .iter()
+            .copied()
+            .filter(|id| match self.bone(*id).and_then(|b| b.parent) {
+                Some(p) => !self.selected.contains(&p),
+                None => true,
+            })
+            .collect();
+        if let Some(active) = self.selection {
+            roots.sort_by_key(|id| (*id != active, id.node.index, id.node.generation));
+        } else {
+            roots.sort_by_key(|id| (id.node.index, id.node.generation));
+        }
+        roots
+    }
+
+    /// Median of selection-root joint positions (shared pivot for multi-root transforms).
+    pub fn selection_pivot(&self, scene: &Scene) -> Option<Vec3> {
+        let roots = self.selection_roots();
+        if roots.is_empty() {
+            return None;
+        }
+        let mut sum = Vec3::ZERO;
+        for id in &roots {
+            sum += scene.world_matrix(id.node).transform_point3(Vec3::ZERO);
+        }
+        Some(sum / roots.len() as f32)
+    }
+
     pub fn clear_model(&mut self, scene: &mut Scene) {
         *scene = empty_scene();
 
@@ -115,7 +204,7 @@ impl RigDocument {
         self.model_root = None;
         self.bones.clear();
         self.bone_index.clear();
-        self.selection = None;
+        self.clear_selection();
         self.bind_locals.clear();
         self.next_bone_serial = 1;
     }
@@ -130,7 +219,7 @@ impl RigDocument {
             Some(root),
             Transform::from_translation(Vec3::Y * 0.35),
         );
-        self.selection = Some(tip);
+        self.set_selection(tip);
         self.capture_bind_pose(scene);
         self.mode = AppMode::Edit;
         self.tool = Tool::Translate;
@@ -177,7 +266,7 @@ impl RigDocument {
             Some(parent),
             Transform::from_translation(Vec3::Y * len),
         );
-        self.selection = Some(id);
+        self.set_selection(id);
         self.write_bind_for(scene, id);
         Some(id)
     }
@@ -192,7 +281,7 @@ impl RigDocument {
             None,
             Transform::from_translation(world_pos),
         );
-        self.selection = Some(id);
+        self.set_selection(id);
         self.write_bind_for(scene, id);
         id
     }
@@ -218,8 +307,13 @@ impl RigDocument {
             b.children.retain(|c| !kill_set.contains(&c.node.key()));
         }
 
-        if self.selection.is_some_and(|s| kill_set.contains(&s.node.key())) {
-            self.selection = None;
+        self.selected
+            .retain(|s| !kill_set.contains(&s.node.key()));
+        if self
+            .selection
+            .is_some_and(|s| kill_set.contains(&s.node.key()))
+        {
+            self.selection = self.selected.iter().copied().next();
         }
 
         for dead in &kill {
@@ -403,9 +497,11 @@ impl RigDocument {
             }
         }
 
+        self.selected
+            .retain(|s| self.bone_index.contains_key(&s.node.key()));
         if let Some(sel) = self.selection {
             if !self.bone_index.contains_key(&sel.node.key()) {
-                self.selection = None;
+                self.selection = self.selected.iter().copied().next();
             }
         }
     }
@@ -430,14 +526,13 @@ impl RigDocument {
     }
 
     pub fn reset_selected(&self, scene: &mut Scene) {
-        let Some(sel) = self.selection else {
-            return;
-        };
-        let Some(local) = self.bind_locals.get(&sel.node.key()).copied() else {
-            return;
-        };
-        if let Some(n) = scene.nodes.get_mut(sel.node) {
-            n.local = local;
+        for id in &self.selected {
+            let Some(local) = self.bind_locals.get(&id.node.key()).copied() else {
+                continue;
+            };
+            if let Some(n) = scene.nodes.get_mut(id.node) {
+                n.local = local;
+            }
         }
     }
 
@@ -581,7 +676,7 @@ pub fn draw_rig_debug(scene: &mut Scene, rig: &RigDocument) {
 
     // Outlines first (drawn under fills in submission order).
     for (from, to, id) in &segments {
-        let outline = if rig.selection == Some(*id) {
+        let outline = if rig.is_selected(*id) {
             BONE_SEL_OUTLINE
         } else {
             BONE_OUTLINE
@@ -593,7 +688,7 @@ pub fn draw_rig_debug(scene: &mut Scene, rig: &RigDocument) {
         );
     }
     for (from, to, id) in &segments {
-        let fill = if rig.selection == Some(*id) {
+        let fill = if rig.is_selected(*id) {
             BONE_SEL_FILL
         } else {
             BONE_FILL
@@ -608,7 +703,7 @@ pub fn draw_rig_debug(scene: &mut Scene, rig: &RigDocument) {
     // Joint dots at bone origins (points render after lines → sit on top).
     for b in &rig.bones {
         let pos = scene.world_matrix(b.id.node).transform_point3(Vec3::ZERO);
-        let selected = rig.selection == Some(b.id);
+        let selected = rig.is_selected(b.id);
         let (outline, fill) = if selected {
             (BONE_SEL_OUTLINE, BONE_SEL_FILL)
         } else {
