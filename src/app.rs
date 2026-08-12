@@ -1,7 +1,7 @@
 //! Application state, UI, and viewport tools.
 
 use glam::{Vec2, Vec3};
-use mega_render::{GizmoAxis, Light, Scene, Visualizer, WgpuVisualizer};
+use mega_render::{GizmoAxis, Light, Scene, SkinningMode, Visualizer, WgpuVisualizer};
 use mega_ui::{DockNode, DockState, ScrollAxes, TextStyle, Ui};
 
 use crate::framework::{Demo, UiCtx, SCENE_TEX};
@@ -717,6 +717,24 @@ impl Demo for RigApp {
                 {
                     ctx.state.rig.show_weights = !weights;
                     ctx.state.rig.invalidate_weight_overlay();
+                }
+                let skin_mode = ctx.state.scene.skinning_mode;
+                let skin_label = format!(
+                    "Skinning: {} → {}",
+                    skin_mode.label(),
+                    skin_mode.next().label()
+                );
+                if ui.menu_item(&skin_label).clicked() {
+                    ctx.state.scene.skinning_mode = skin_mode.next();
+                    ctx.state.rig.invalidate_weight_overlay();
+                    ctx.state.status = format!(
+                        "Skinning: {} ({})",
+                        ctx.state.scene.skinning_mode.label(),
+                        match ctx.state.scene.skinning_mode {
+                            SkinningMode::LinearBlend => "matrix blend",
+                            SkinningMode::DualQuat => "dual quaternion",
+                        }
+                    );
                 }
                 if ui
                     .menu_item(if colliders {

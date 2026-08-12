@@ -1,7 +1,7 @@
 //! Shape-key sculpt: mesh picking + Grab / Inflate / Smooth brushes.
 
 use glam::{Mat4, Vec2, Vec3};
-use mega_render::{Handle, Mesh, Scene};
+use mega_render::{skin_mesh_matrix, skin_mesh_point, Handle, Mesh, Scene};
 use mega_ui::Rect;
 
 use crate::pick::{self, Ray};
@@ -57,13 +57,14 @@ pub fn pick_mesh(scene: &Scene, ray: &Ray) -> Option<MeshHit> {
             .skin
             .map(|skin_h| scene.joint_matrices_with_cache(skin_h, node_h, &world))
             .filter(|m| !m.is_empty());
+        let mode = scene.skinning_mode;
 
         let nverts = mesh.positions.len();
         let mut pos_w = vec![Vec3::ZERO; nverts];
         for i in 0..nverts {
             let p = Vec3::from_array(mesh.positions[i]);
             let local = if let Some(ref mats) = skin_mats {
-                skin_point(mesh, mats, i, p)
+                skin_mesh_point(mesh, mats, i, p, mode)
             } else {
                 p
             };
@@ -126,64 +127,6 @@ pub fn pick_mesh(scene: &Scene, ray: &Ray) -> Option<MeshHit> {
     best
 }
 
-fn skin_point(mesh: &Mesh, mats: &[Mat4], i: usize, p: Vec3) -> Vec3 {
-    let (Some(joints), Some(weights)) = (&mesh.joints, &mesh.weights) else {
-        return p;
-    };
-    if i >= joints.len() || i >= weights.len() {
-        return p;
-    }
-    let ji = joints[i];
-    let wi = weights[i];
-    let mut skinned = Vec3::ZERO;
-    let mut w_sum = 0.0f32;
-    for k in 0..4 {
-        let idx = ji[k] as usize;
-        let w = wi[k];
-        if w <= 0.0 || idx >= mats.len() {
-            continue;
-        }
-        skinned += mats[idx].transform_point3(p) * w;
-        w_sum += w;
-    }
-    if w_sum < 1e-6 {
-        p
-    } else if (w_sum - 1.0).abs() > 1e-3 {
-        skinned / w_sum
-    } else {
-        skinned
-    }
-}
-
-fn skin_matrix(mesh: &Mesh, mats: &[Mat4], i: usize) -> Mat4 {
-    let (Some(joints), Some(weights)) = (&mesh.joints, &mesh.weights) else {
-        return Mat4::IDENTITY;
-    };
-    if i >= joints.len() || i >= weights.len() {
-        return Mat4::IDENTITY;
-    }
-    let ji = joints[i];
-    let wi = weights[i];
-    let mut out = Mat4::ZERO;
-    let mut w_sum = 0.0f32;
-    for k in 0..4 {
-        let idx = ji[k] as usize;
-        let w = wi[k];
-        if w <= 0.0 || idx >= mats.len() {
-            continue;
-        }
-        out += mats[idx] * w;
-        w_sum += w;
-    }
-    if w_sum < 1e-6 {
-        Mat4::IDENTITY
-    } else if (w_sum - 1.0).abs() > 1e-3 {
-        out * (1.0 / w_sum)
-    } else {
-        out
-    }
-}
-
 fn ray_triangle(ray: &Ray, v0: Vec3, v1: Vec3, v2: Vec3) -> Option<(f32, Vec3)> {
     const EPS: f32 = 1e-7;
     let e1 = v1 - v0;
@@ -232,6 +175,7 @@ fn collect_brush_verts(
         .and_then(|n| n.skin)
         .map(|skin_h| scene.joint_matrices_with_cache(skin_h, node_h, &world))
         .filter(|m| !m.is_empty());
+    let mode = scene.skinning_mode;
 
     let radius = radius.max(1e-4);
     let nverts = mesh.positions.len();
@@ -239,7 +183,7 @@ fn collect_brush_verts(
     for i in 0..nverts {
         let p = Vec3::from_array(mesh.positions[i]);
         let local = if let Some(ref mats) = skin_mats {
-            skin_point(mesh, mats, i, p)
+            skin_mesh_point(mesh, mats, i, p, mode)
         } else {
             p
         };
@@ -388,6 +332,7 @@ fn apply_grab(
         .and_then(|n| n.skin)
         .map(|skin_h| scene.joint_matrices_with_cache(skin_h, drag.node, &world))
         .filter(|m| !m.is_empty());
+    let mode = scene.skinning_mode;
 
     let deltas: Vec<(usize, [f32; 3])> = {
         let Some(mesh) = scene.meshes.get(drag.mesh) else {
@@ -397,7 +342,7 @@ fn apply_grab(
             .iter()
             .filter_map(|&(vi, falloff)| {
                 let skin = if let Some(ref mats) = skin_mats {
-                    skin_matrix(mesh, mats, vi)
+                    skin_mesh_matrix(mesh, mats, vi, mode)
                 } else {
                     Mat4::IDENTITY
                 };

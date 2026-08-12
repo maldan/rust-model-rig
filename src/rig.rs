@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 
 use glam::Vec3;
 use mega_render::{
-    load_gltf, Camera, DirectionalLight, Handle, Light, LineOpts, Mesh, Node, PointLight, PolyOpts,
-    Scene, Skin, Transform,
+    blend_skin_point, blend_skin_vector, load_gltf, Camera, DirectionalLight, Handle, Light,
+    LineOpts, Mesh, Node, PointLight, PolyOpts, Scene, Skin, Transform,
 };
 
 #[derive(Clone, Copy)]
@@ -390,7 +390,9 @@ impl RigDocument {
     }
 
     pub fn clear_model(&mut self, scene: &mut Scene) {
+        let skinning_mode = scene.skinning_mode;
         *scene = empty_scene();
+        scene.skinning_mode = skinning_mode;
 
         self.source_path = None;
         self.model_root = None;
@@ -1575,26 +1577,8 @@ fn rebuild_weight_overlay(scene: &Scene, rig: &RigDocument) -> Vec<(Vec3, Vec3, 
                 .get(i)
                 .map(|n| Vec3::from_array(*n))
                 .unwrap_or(Vec3::Y);
-            let mut skinned_p = Vec3::ZERO;
-            let mut skinned_n = Vec3::ZERO;
-            let mut w_sum = 0.0f32;
-            for k in 0..4 {
-                let idx = ji[k] as usize;
-                let w = wi[k];
-                if w <= 0.0 || idx >= mats.len() {
-                    continue;
-                }
-                skinned_p += mats[idx].transform_point3(p) * w;
-                skinned_n += mats[idx].transform_vector3(n) * w;
-                w_sum += w;
-            }
-            if w_sum < 1e-6 {
-                skinned_p = p;
-                skinned_n = n;
-            } else if (w_sum - 1.0).abs() > 1e-3 {
-                skinned_p /= w_sum;
-                skinned_n /= w_sum;
-            }
+            let skinned_p = blend_skin_point(&mats, ji, wi, p, scene.skinning_mode);
+            let skinned_n = blend_skin_vector(&mats, ji, wi, n, scene.skinning_mode);
             pos_w[i] = mesh_world.transform_point3(skinned_p);
             let nw = normal_world.transform_vector3(skinned_n);
             nrm_w[i] = if nw.length_squared() > 1e-10 {
