@@ -22,7 +22,7 @@ use crate::gizmo;
 use crate::ik_chain::{draw_ik_helpers, evaluate_ik_chains};
 use crate::rig::{draw_rig_debug, draw_weight_debug, AppMode, Tool};
 use crate::sculpt;
-use crate::soft_chain::{draw_soft_helpers, evaluate_soft_chains};
+use crate::soft_chain::{draw_bone_colliders, draw_soft_helpers, evaluate_soft_chains};
 
 /// Texture slot for the 3D viewport (`ui.texture(SCENE_TEX, …)`).
 pub const SCENE_TEX: u32 = 0;
@@ -716,6 +716,7 @@ impl<D: Demo> Host<D> {
             draw_rig_debug(&mut self.state.scene, &self.state.rig);
             draw_ik_helpers(&mut self.state.scene, &self.state.rig);
             draw_soft_helpers(&mut self.state.scene, &self.state.rig);
+            draw_bone_colliders(&mut self.state.scene, &self.state.rig);
             draw_weight_debug(&mut self.state.scene, &mut self.state.rig);
             if self.state.rig.mode == AppMode::Shape
                 && self.state.rig.tool == Tool::Brush

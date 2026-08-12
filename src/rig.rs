@@ -128,6 +128,21 @@ pub enum IkControlKind {
     Pole,
 }
 
+/// Soft capsule collider attached to a bone (local medial axis + radius).
+#[derive(Clone, Debug)]
+pub struct BoneCollider {
+    pub id: u32,
+    pub bone: BoneId,
+    pub enabled: bool,
+    /// Capsule segment start in bone local space.
+    pub a_local: Vec3,
+    /// Capsule segment end in bone local space.
+    pub b_local: Vec3,
+    pub radius: f32,
+    /// Soft push amount (0 = jelly, 1 = firmer — still penetrable).
+    pub softness: f32,
+}
+
 /// Secondary dynamics: gravity + spring-to-pose + support plane (hair / cloth / soft tissue).
 #[derive(Clone, Debug)]
 pub struct SoftChain {
@@ -153,7 +168,7 @@ pub struct SoftChain {
     /// How much motion trails the soft root (0 = glued, 1 = normal, >1 = exaggerated).
     /// Uses stable positional lag + accel response; safe with constraint absorb.
     pub inertia: f32,
-    /// Radians from animated rest direction.
+    /// Radians from animated rest direction (cone).
     pub max_angle: f32,
     /// Runtime Verlet state (world). Includes virtual tip as last particle.
     pub(crate) prev_pos: Vec<Vec3>,
@@ -212,6 +227,8 @@ pub struct RigDocument {
     pub ik_chains: Vec<IkChain>,
     /// Soft / secondary bone chains (gravity + support).
     pub soft_chains: Vec<SoftChain>,
+    /// Soft capsule colliders on bones (body / breast volume, etc.).
+    pub colliders: Vec<BoneCollider>,
     /// Mesh used for shape-key editing.
     pub active_mesh: Option<Handle<Mesh>>,
     /// Active morph target index on `active_mesh`.
@@ -227,6 +244,7 @@ pub struct RigDocument {
     next_bone_serial: u32,
     next_ik_serial: u32,
     next_soft_serial: u32,
+    next_collider_serial: u32,
     next_shape_serial: u32,
 }
 
@@ -250,6 +268,7 @@ impl Default for RigDocument {
             transform_space: TransformSpace::Local,
             ik_chains: Vec::new(),
             soft_chains: Vec::new(),
+            colliders: Vec::new(),
             active_mesh: None,
             active_shape: None,
             brush_radius: 0.08,
@@ -262,6 +281,7 @@ impl Default for RigDocument {
             next_bone_serial: 1,
             next_ik_serial: 1,
             next_soft_serial: 1,
+            next_collider_serial: 1,
             next_shape_serial: 1,
         }
     }
@@ -373,6 +393,7 @@ impl RigDocument {
         self.bind_locals.clear();
         self.ik_chains.clear();
         self.soft_chains.clear();
+        self.colliders.clear();
         self.active_mesh = None;
         self.active_shape = None;
         self.brush_radius = 0.08;
@@ -381,6 +402,7 @@ impl RigDocument {
         self.next_bone_serial = 1;
         self.next_ik_serial = 1;
         self.next_soft_serial = 1;
+        self.next_collider_serial = 1;
         self.next_shape_serial = 1;
         self.weight_overlay.clear();
         self.show_weights = false;
@@ -546,6 +568,8 @@ impl RigDocument {
             !kill_set.contains(&c.anchor.node.key())
                 && !c.bones.iter().any(|b| kill_set.contains(&b.node.key()))
         });
+        self.colliders
+            .retain(|c| !kill_set.contains(&c.bone.node.key()));
 
         // Detach from surviving parents' children lists.
         for b in &mut self.bones {
@@ -821,6 +845,64 @@ impl RigDocument {
                 c.initialized = false;
             }
         }
+    }
+
+    pub fn collider_on_bone(&self, id: BoneId) -> Option<&BoneCollider> {
+        self.colliders.iter().find(|c| c.bone == id)
+    }
+
+    /// Capsule along bone→child (or +Y), soft by default.
+    pub fn create_capsule_collider(
+        &mut self,
+        scene: &Scene,
+        bone: BoneId,
+    ) -> Result<u32, &'static str> {
+        if self.bone(bone).is_none() {
+            return Err("Unknown bone");
+        }
+        if self.collider_on_bone(bone).is_some() {
+            return Err("Bone already has a collider");
+        }
+
+        let bone_m = scene.world_matrix(bone.node);
+        let inv = bone_m.inverse();
+
+        let tip_world = self
+            .bone(bone)
+            .map(|b| b.children.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .next()
+            .map(|ch| scene.world_matrix(ch.node).transform_point3(Vec3::ZERO))
+            .unwrap_or_else(|| bone_m.transform_point3(Vec3::Y * 0.12));
+
+        let mut tip_local = inv.transform_point3(tip_world);
+        if tip_local.length_squared() < 1e-8 {
+            tip_local = Vec3::Y * 0.12;
+        }
+        let len = tip_local.length().max(1e-3);
+        let axis = tip_local.normalize();
+        // Keep a bit of stem so the capsule sits on the bone segment.
+        let a_local = axis * (len * 0.05);
+        let b_local = axis * (len * 0.95);
+        let radius = (len * 0.35).max(0.01);
+
+        let id = self.next_collider_serial;
+        self.next_collider_serial += 1;
+        self.colliders.push(BoneCollider {
+            id,
+            bone,
+            enabled: true,
+            a_local,
+            b_local,
+            radius,
+            softness: 0.35,
+        });
+        Ok(id)
+    }
+
+    pub fn remove_collider(&mut self, collider_id: u32) {
+        self.colliders.retain(|c| c.id != collider_id);
     }
 
     fn insert_control_bone(
@@ -1221,6 +1303,33 @@ impl RigDocument {
         }
         let sum: f32 = segs.iter().map(|(a, b, _)| (*b - *a).length()).sum();
         (sum / segs.len() as f32).max(0.05)
+    }
+}
+
+impl BoneCollider {
+    pub fn length(&self) -> f32 {
+        (self.b_local - self.a_local).length()
+    }
+
+    /// Midpoint projected along the capsule axis, from bone origin along that axis.
+    pub fn axis_offset(&self) -> f32 {
+        let mut axis = (self.b_local - self.a_local).normalize_or_zero();
+        if axis.length_squared() < 1e-8 {
+            axis = Vec3::Y;
+        }
+        let mid = (self.a_local + self.b_local) * 0.5;
+        mid.dot(axis)
+    }
+
+    pub fn set_length_offset(&mut self, length: f32, offset: f32) {
+        let mut axis = (self.b_local - self.a_local).normalize_or_zero();
+        if axis.length_squared() < 1e-8 {
+            axis = Vec3::Y;
+        }
+        let len = length.max(1e-4);
+        let mid = axis * offset;
+        self.a_local = mid - axis * (len * 0.5);
+        self.b_local = mid + axis * (len * 0.5);
     }
 }
 

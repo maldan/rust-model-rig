@@ -1402,8 +1402,54 @@ fn inspector_panel_body(ui: &mut Ui, state: &mut AppState) {
                         state.status =
                             "Soft created · Pose mode: gravity + support plane".into();
                     }
-                    Err(e) => {
-                        state.status = e.into();
+                    Err(e) => state.status = e.into(),
+                }
+            }
+            ui.separator();
+        }
+    }
+
+    // Capsule collider on selected bone
+    {
+        let is_control = state.rig.ik_control_kind(sel).is_some();
+        if !is_control {
+            let col_id = state.rig.collider_on_bone(sel).map(|c| c.id);
+            if let Some(cid) = col_id {
+                ui.label("Capsule collider");
+                if let Some(c) = state.rig.colliders.iter_mut().find(|c| c.id == cid) {
+                    let _ = ui.checkbox(&format!("Enabled##col_en_{cid}"), &mut c.enabled);
+                    ui.label("Radius");
+                    let _ = ui.slider(&format!("col_r_{cid}"), &mut c.radius, 0.005..=2.0);
+                    ui.label("Length");
+                    let mut len = c.length();
+                    let mut off = c.axis_offset();
+                    if ui
+                        .slider(&format!("col_l_{cid}"), &mut len, 0.01..=3.0)
+                        .changed()
+                    {
+                        c.set_length_offset(len, off);
+                    }
+                    ui.label("Offset along axis");
+                    len = c.length();
+                    if ui
+                        .slider(&format!("col_o_{cid}"), &mut off, -2.0..=2.0)
+                        .changed()
+                    {
+                        c.set_length_offset(len.max(0.01), off);
+                    }
+                    ui.label("Softness (0=jelly, 1=firmer)");
+                    let _ = ui.slider(&format!("col_s_{cid}"), &mut c.softness, 0.0..=1.0);
+                }
+                if ui.button("Remove Collider").clicked() {
+                    state.rig.remove_collider(cid);
+                    state.status = "Collider removed".into();
+                }
+            } else {
+                ui.label("Collider: capsule volume on this bone");
+                if ui.button("Add Capsule Collider").clicked() {
+                    match state.rig.create_capsule_collider(&state.scene, sel) {
+                        Ok(_) => state.status = "Capsule collider added".into(),
+                        Err(e) => state.status = e.into(),
                     }
                 }
             }
