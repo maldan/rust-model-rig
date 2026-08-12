@@ -1,16 +1,37 @@
 //! Soft bone chains: world-gravity Verlet + spring to animated pose + support plane.
-//! Capsule↔capsule soft collision (no particle↔capsule).
+//! Capsule↔capsule soft collision (no particle↔capsule). Soft-grab for testing.
 
-use glam::{Quat, Vec3};
+use glam::{Quat, Vec2, Vec3};
 use mega_render::{LineOpts, Scene, Transform};
+use mega_ui::Rect;
 use std::collections::HashMap;
 use std::f32::consts::TAU;
 
 use crate::ik::quat_from_matrix;
+use crate::pick::{self, Ray};
 use crate::rig::{AppMode, BoneCollider, BoneId, RigDocument, SoftChain};
 
 const CONSTRAINT_ITERS: u32 = 6;
 const SUBSTEPS: u32 = 4;
+/// How hard Soft Grab pulls toward the cursor per constraint pass (0–1).
+const GRAB_BLEND: f32 = 0.55;
+/// Grab corrections move `prev` with `curr` (1 = no Verlet impulse from dragging).
+const GRAB_PREV_FOLLOW: f32 = 1.0;
+/// Falloff along root→grab (`< 1` = mid-chain feels more of the pull).
+const GRAB_CHAIN_POWER: f32 = 0.5;
+
+/// Active Soft Grab: soft-pin one particle to a camera-plane cursor target.
+#[derive(Clone, Debug)]
+pub struct SoftGrabDrag {
+    pub chain_id: u32,
+    /// Index into `SoftChain::curr_pos` (≥ 1; root is pinned to body).
+    pub particle: usize,
+    /// Bone to select while grabbing (tip particle → last bone).
+    pub bone: BoneId,
+    pub target: Vec3,
+    pub plane_point: Vec3,
+    pub plane_normal: Vec3,
+}
 
 struct WorldCapsule {
     a: Vec3,
@@ -36,7 +57,12 @@ struct ChainScratch {
 }
 
 /// Run all enabled soft chains (Pose only). Call after IK.
-pub fn evaluate_soft_chains(scene: &mut Scene, rig: &mut RigDocument, dt: f32) {
+pub fn evaluate_soft_chains(
+    scene: &mut Scene,
+    rig: &mut RigDocument,
+    dt: f32,
+    grab: Option<&SoftGrabDrag>,
+) {
     if rig.mode != AppMode::Pose {
         return;
     }
@@ -60,6 +86,17 @@ pub fn evaluate_soft_chains(scene: &mut Scene, rig: &mut RigDocument, dt: f32) {
         })
         .collect();
 
+    // While Soft Grab holds a chain: no rest-spring fight (avoids stored snap energy).
+    if let Some(g) = grab {
+        for (i, chain) in chains.iter().enumerate() {
+            if chain.id == g.chain_id {
+                if let Some(s) = scratches[i].as_mut() {
+                    s.stiff = 0.0;
+                }
+            }
+        }
+    }
+
     for _ in 0..SUBSTEPS {
         for i in 0..chains.len() {
             if let Some(scratch) = scratches[i].as_ref() {
@@ -68,11 +105,17 @@ pub fn evaluate_soft_chains(scene: &mut Scene, rig: &mut RigDocument, dt: f32) {
         }
         for i in 0..chains.len() {
             if let Some(scratch) = scratches[i].as_ref() {
-                constrain_chain(&mut chains[i], scratch);
+                constrain_chain(&mut chains[i], scratch, grab);
             }
         }
         // Capsule↔capsule from *current* particle poses (lockstep) — stable, no particle hits.
         resolve_capsule_capsule(scene, &mut chains, &scratches, &colliders);
+        // Held grab is kinematic: kill Verlet velocity so release can't shoot.
+        if let Some(g) = grab {
+            if let Some(chain) = chains.iter_mut().find(|c| c.id == g.chain_id) {
+                zero_chain_verlet_vel(chain);
+            }
+        }
     }
 
     for i in 0..chains.len() {
@@ -82,6 +125,171 @@ pub fn evaluate_soft_chains(scene: &mut Scene, rig: &mut RigDocument, dt: f32) {
     }
 
     rig.soft_chains = chains;
+}
+
+/// Pick nearest soft particle under the cursor and start a Soft Grab.
+pub fn begin_soft_grab(
+    scene: &Scene,
+    rig: &RigDocument,
+    viewport: Rect,
+    cursor: Vec2,
+) -> Option<SoftGrabDrag> {
+    let ray = pick::ray_from_viewport(scene, viewport, cursor)?;
+    let (chain_id, particle, bone, hit) = pick_soft_particle(scene, rig, &ray)?;
+
+    let plane_normal = (scene.camera.target - scene.camera.eye).normalize_or_zero();
+    let plane_normal = if plane_normal.length_squared() < 1e-8 {
+        -ray.dir
+    } else {
+        plane_normal
+    };
+
+    Some(SoftGrabDrag {
+        chain_id,
+        particle,
+        bone,
+        target: hit,
+        plane_point: hit,
+        plane_normal,
+    })
+}
+
+/// Update grab target from cursor (camera-facing plane).
+pub fn update_soft_grab(scene: &Scene, drag: &mut SoftGrabDrag, viewport: Rect, cursor: Vec2) {
+    let Some(ray) = pick::ray_from_viewport(scene, viewport, cursor) else {
+        return;
+    };
+    if let Some(hit) = ray_plane(&ray, drag.plane_point, drag.plane_normal) {
+        drag.target = hit;
+    }
+}
+
+fn pick_soft_particle(
+    scene: &Scene,
+    rig: &RigDocument,
+    ray: &Ray,
+) -> Option<(u32, usize, BoneId, Vec3)> {
+    let mut best: Option<(f32, u32, usize, BoneId, Vec3)> = None;
+    for chain in &rig.soft_chains {
+        if !chain.enabled || chain.bones.len() < 2 {
+            continue;
+        }
+        let n_bones = chain.bones.len();
+        let n = n_bones + 1;
+        let use_sim = chain.initialized && chain.curr_pos.len() == n;
+        let scale: f32 = chain.lengths.iter().copied().sum::<f32>() + chain.tip_length;
+        let radius = (scale * 0.12).clamp(0.02, 0.12);
+
+        for i in 1..n {
+            let p = if use_sim {
+                chain.curr_pos[i]
+            } else if i < n_bones {
+                scene
+                    .world_matrix(chain.bones[i].node)
+                    .transform_point3(Vec3::ZERO)
+            } else {
+                let tip = chain.bones[n_bones - 1];
+                let m = scene.world_matrix(tip.node);
+                let origin = m.transform_point3(Vec3::ZERO);
+                let axis = m.transform_vector3(Vec3::Y).normalize_or_zero();
+                origin + axis * chain.tip_length.max(1e-4)
+            };
+            let Some(t) = ray_sphere(ray, p, radius) else {
+                continue;
+            };
+            let bone = if i < n_bones {
+                chain.bones[i]
+            } else {
+                chain.bones[n_bones - 1]
+            };
+            if best.is_none_or(|(bt, ..)| t < bt) {
+                best = Some((t, chain.id, i, bone, p));
+            }
+        }
+    }
+    best.map(|(_, cid, i, bone, p)| (cid, i, bone, p))
+}
+
+fn ray_sphere(ray: &Ray, center: Vec3, radius: f32) -> Option<f32> {
+    let oc = ray.origin - center;
+    let a = ray.dir.dot(ray.dir);
+    let b = 2.0 * oc.dot(ray.dir);
+    let c = oc.dot(oc) - radius * radius;
+    let disc = b * b - 4.0 * a * c;
+    if disc < 0.0 {
+        return None;
+    }
+    let s = disc.sqrt();
+    let t0 = (-b - s) / (2.0 * a);
+    let t1 = (-b + s) / (2.0 * a);
+    if t0 >= 0.0 {
+        Some(t0)
+    } else if t1 >= 0.0 {
+        Some(t1)
+    } else {
+        None
+    }
+}
+
+fn ray_plane(ray: &Ray, point: Vec3, normal: Vec3) -> Option<Vec3> {
+    let n = normal.normalize_or_zero();
+    if n.length_squared() < 1e-8 {
+        return None;
+    }
+    let denom = ray.dir.dot(n);
+    if denom.abs() < 1e-8 {
+        return None;
+    }
+    let t = (point - ray.origin).dot(n) / denom;
+    if t < 0.0 {
+        return None;
+    }
+    Some(ray.origin + ray.dir * t)
+}
+
+fn apply_soft_grab(chain: &mut SoftChain, grab: &SoftGrabDrag) {
+    if chain.id != grab.chain_id {
+        return;
+    }
+    let i = grab.particle;
+    let n = chain.curr_pos.len();
+    if i == 0 || i >= n {
+        return;
+    }
+    // Move the whole chain toward the cursor: full pull at the grabbed joint,
+    // falloff toward the root, tip-beyond-grab follows with the same delta.
+    let delta = (grab.target - chain.curr_pos[i]) * GRAB_BLEND;
+    if delta.length_squared() < 1e-14 {
+        return;
+    }
+    let inv_i = 1.0 / i as f32;
+    for j in 1..n {
+        let w = if j <= i {
+            (j as f32 * inv_i).powf(GRAB_CHAIN_POWER)
+        } else {
+            1.0
+        };
+        let corr = delta * w;
+        chain.curr_pos[j] += corr;
+        chain.prev_pos[j] += corr * GRAB_PREV_FOLLOW;
+    }
+}
+
+/// Kill grab-induced Verlet velocity so release doesn't shoot the chain.
+pub fn release_soft_grab(rig: &mut RigDocument, grab: &SoftGrabDrag) {
+    let Some(chain) = rig.soft_chains.iter_mut().find(|c| c.id == grab.chain_id) else {
+        return;
+    };
+    zero_chain_verlet_vel(chain);
+    // Soften spring snap-back for a short window after release.
+    chain.grab_relax = 1.0;
+}
+
+fn zero_chain_verlet_vel(chain: &mut SoftChain) {
+    let n = chain.curr_pos.len().min(chain.prev_pos.len());
+    for j in 1..n {
+        chain.prev_pos[j] = chain.curr_pos[j];
+    }
 }
 
 fn restore_soft_bind(
@@ -193,8 +401,16 @@ fn prepare_chain(scene: &mut Scene, chain: &mut SoftChain, dt: f32) -> Option<Ch
     let gravity = Vec3::new(0.0, -chain.gravity, 0.0);
     let h = dt / SUBSTEPS as f32;
     let h2 = h * h;
-    let vel_keep = (-chain.damping.max(0.0) * h).exp();
-    let stiff = chain.stiffness.max(0.0);
+    let relax = chain.grab_relax.clamp(0.0, 1.0);
+    let mut damp = chain.damping.max(0.0);
+    let mut stiff = chain.stiffness.max(0.0);
+    if relax > 1e-4 {
+        // Soft settle after Soft Grab: little spring snap, extra damping.
+        stiff *= 1.0 - 0.95 * relax;
+        damp *= 1.0 + 5.0 * relax;
+        chain.grab_relax = (relax - dt * 2.5).max(0.0);
+    }
+    let vel_keep = (-damp * h).exp();
 
     let anchor_rot = quat_from_matrix(scene.world_matrix(chain.anchor.node));
     let mut support_n = (anchor_rot * chain.support_normal_local).normalize_or_zero();
@@ -257,7 +473,7 @@ fn integrate_chain(chain: &mut SoftChain, scratch: &ChainScratch) {
     }
 }
 
-fn constrain_chain(chain: &mut SoftChain, scratch: &ChainScratch) {
+fn constrain_chain(chain: &mut SoftChain, scratch: &ChainScratch, grab: Option<&SoftGrabDrag>) {
     let n = chain.curr_pos.len();
     let plane_p = scratch.rest[0];
     let max_angle = scratch.max_angle;
@@ -265,6 +481,11 @@ fn constrain_chain(chain: &mut SoftChain, scratch: &ChainScratch) {
 
     for _ in 0..CONSTRAINT_ITERS {
         chain.curr_pos[0] = scratch.rest[0];
+        // Pull the chain first; length/angle then reshape it as a bend.
+        if let Some(g) = grab {
+            apply_soft_grab(chain, g);
+            chain.curr_pos[0] = scratch.rest[0];
+        }
         for i in 1..n {
             let parent = chain.curr_pos[i - 1];
             let len = scratch.seg_len[i];
@@ -302,9 +523,16 @@ fn constrain_chain(chain: &mut SoftChain, scratch: &ChainScratch) {
             chain.curr_pos[i] = p;
             let corr = p - old;
             let clen = corr.length();
-            let shock = (len * 0.2).max(1e-4);
-            if clen > shock {
-                chain.prev_pos[i] += corr * ((clen - shock) / clen);
+            // While Soft Grab holds (or just released), fully absorb constraint jumps
+            // so length/angle settle doesn't inject a shoot velocity.
+            let holding = grab.is_some_and(|g| g.chain_id == chain.id) || chain.grab_relax > 0.05;
+            if holding {
+                chain.prev_pos[i] += corr;
+            } else {
+                let shock = (len * 0.2).max(1e-4);
+                if clen > shock {
+                    chain.prev_pos[i] += corr * ((clen - shock) / clen);
+                }
             }
 
             if (p - plane_p).dot(support_n) < 1e-4 {
@@ -650,8 +878,30 @@ pub fn draw_soft_helpers(scene: &mut Scene, rig: &RigDocument) {
     }
 }
 
+/// Soft Grab feedback: particle → cursor target.
+pub fn draw_soft_grab(scene: &mut Scene, rig: &RigDocument, grab: &SoftGrabDrag) {
+    let Some(chain) = rig.soft_chains.iter().find(|c| c.id == grab.chain_id) else {
+        return;
+    };
+    if grab.particle >= chain.curr_pos.len() {
+        return;
+    }
+    let p = chain.curr_pos[grab.particle];
+    let col = [1.0, 0.85, 0.25, 0.95];
+    scene.debug.sphere(p, 0.018, col, false);
+    scene.debug.line(
+        p,
+        grab.target,
+        LineOpts::color(col).width(2.0).overlay(),
+    );
+    scene.debug.sphere(grab.target, 0.012, [1.0, 0.55, 0.15, 0.9], false);
+}
+
 /// Debug wire capsules for bone colliders (Edit + Pose).
 pub fn draw_bone_colliders(scene: &mut Scene, rig: &RigDocument) {
+    if !rig.show_colliders {
+        return;
+    }
     for c in &rig.colliders {
         if !c.enabled {
             continue;

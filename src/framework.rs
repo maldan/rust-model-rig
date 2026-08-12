@@ -22,7 +22,9 @@ use crate::gizmo;
 use crate::ik_chain::{draw_ik_helpers, evaluate_ik_chains};
 use crate::rig::{draw_rig_debug, draw_weight_debug, AppMode, Tool};
 use crate::sculpt;
-use crate::soft_chain::{draw_bone_colliders, draw_soft_helpers, evaluate_soft_chains};
+use crate::soft_chain::{
+    draw_bone_colliders, draw_soft_grab, draw_soft_helpers, evaluate_soft_chains,
+};
 
 /// Texture slot for the 3D viewport (`ui.texture(SCENE_TEX, …)`).
 pub const SCENE_TEX: u32 = 0;
@@ -701,7 +703,12 @@ impl<D: Demo> Host<D> {
             // Pose IK: solve after tools so targets moved this frame apply.
             evaluate_ik_chains(&mut self.state.scene, &self.state.rig);
             // Soft chains: after IK so they inherit body / limb motion.
-            evaluate_soft_chains(&mut self.state.scene, &mut self.state.rig, dt);
+            evaluate_soft_chains(
+                &mut self.state.scene,
+                &mut self.state.rig,
+                dt,
+                self.state.soft_grab_drag.as_ref(),
+            );
 
             // Debug / gizmo after tools so pose matches this frame.
             self.state.scene.debug.clear();
@@ -716,6 +723,9 @@ impl<D: Demo> Host<D> {
             draw_rig_debug(&mut self.state.scene, &self.state.rig);
             draw_ik_helpers(&mut self.state.scene, &self.state.rig);
             draw_soft_helpers(&mut self.state.scene, &self.state.rig);
+            if let Some(ref grab) = self.state.soft_grab_drag {
+                draw_soft_grab(&mut self.state.scene, &self.state.rig, grab);
+            }
             draw_bone_colliders(&mut self.state.scene, &self.state.rig);
             draw_weight_debug(&mut self.state.scene, &mut self.state.rig);
             if self.state.rig.mode == AppMode::Shape
@@ -1111,6 +1121,14 @@ impl<D: Demo> ApplicationHandler for Host<D> {
                                         crate::rig::BrushKind::Inflate => "Tool: Inflate".into(),
                                         crate::rig::BrushKind::Smooth => "Tool: Smooth".into(),
                                     };
+                                }
+                            }
+                            KeyCode::KeyH => {
+                                if self.state.rig.mode == crate::rig::AppMode::Pose {
+                                    self.state.rig.tool = crate::rig::Tool::SoftGrab;
+                                    self.state.clear_drags();
+                                    self.state.status =
+                                        "Tool: Soft Grab — drag soft joints".into();
                                 }
                             }
                             KeyCode::KeyA => {

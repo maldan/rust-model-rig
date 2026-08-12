@@ -60,6 +60,8 @@ pub enum Tool {
     Rotate,
     /// Shape mode: sculpt brush (`brush_kind`).
     Brush,
+    /// Pose: soft-grab a soft-chain particle (test / poke physics).
+    SoftGrab,
 }
 
 /// Sculpt brush mode (Shape + `Tool::Brush`).
@@ -178,6 +180,8 @@ pub struct SoftChain {
     /// Soft-root world velocity (for inertia / fictitious force).
     pub(crate) prev_root_vel: Vec3,
     pub(crate) initialized: bool,
+    /// 1 just after Soft Grab release; decays each frame to soften spring snap-back.
+    pub(crate) grab_relax: f32,
 }
 
 #[derive(Clone)]
@@ -217,6 +221,8 @@ pub struct RigDocument {
     pub show_mesh: bool,
     /// Heat-map overlay for selected bone influence on skinned meshes.
     pub show_weights: bool,
+    /// Debug wire capsules for bone colliders.
+    pub show_colliders: bool,
     /// Cached weight tris; rebuilt only when dirty (selection / pose / load).
     weight_overlay: WeightOverlayCache,
     pub mode: AppMode,
@@ -261,6 +267,7 @@ impl Default for RigDocument {
             show_skeleton: true,
             show_mesh: true,
             show_weights: false,
+            show_colliders: true,
             weight_overlay: WeightOverlayCache::default(),
             mode: AppMode::Pose,
             tool: Tool::Rotate,
@@ -830,6 +837,7 @@ impl RigDocument {
             prev_root_world: glam::Mat4::IDENTITY,
             prev_root_vel: Vec3::ZERO,
             initialized: false,
+            grab_relax: 0.0,
         });
         Ok(id)
     }

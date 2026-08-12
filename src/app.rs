@@ -1,7 +1,7 @@
 //! Application state, UI, and viewport tools.
 
 use glam::{Vec2, Vec3};
-use mega_render::{GizmoAxis, Scene, Visualizer, WgpuVisualizer};
+use mega_render::{GizmoAxis, Light, Scene, Visualizer, WgpuVisualizer};
 use mega_ui::{DockNode, DockState, ScrollAxes, TextStyle, Ui};
 
 use crate::framework::{Demo, UiCtx, SCENE_TEX};
@@ -13,6 +13,7 @@ use crate::rig::{
     TransformSpace,
 };
 use crate::sculpt::{self, SculptDrag};
+use crate::soft_chain::{self, SoftGrabDrag};
 use crate::verlet::{self, VerletDrag};
 
 pub struct AppState {
@@ -24,6 +25,7 @@ pub struct AppState {
     pub ik_drag: Option<IkPullDrag>,
     pub verlet_drag: Option<VerletDrag>,
     pub sculpt_drag: Option<SculptDrag>,
+    pub soft_grab_drag: Option<SoftGrabDrag>,
     pub marquee: Option<MarqueeDrag>,
     pub gizmo_hover: Option<GizmoAxis>,
     /// Euler degrees shown in inspector (synced from selection).
@@ -56,6 +58,7 @@ impl AppState {
             ik_drag: None,
             verlet_drag: None,
             sculpt_drag: None,
+            soft_grab_drag: None,
             marquee: None,
             gizmo_hover: None,
             edit_euler_deg: Vec3::ZERO,
@@ -73,6 +76,7 @@ impl AppState {
             || self.ik_drag.is_some()
             || self.verlet_drag.is_some()
             || self.sculpt_drag.is_some()
+            || self.soft_grab_drag.is_some()
             || self.marquee.is_some()
     }
 
@@ -82,6 +86,7 @@ impl AppState {
         self.ik_drag = None;
         self.verlet_drag = None;
         self.sculpt_drag = None;
+        self.soft_grab_drag = None;
         self.marquee = None;
     }
 
@@ -260,6 +265,9 @@ pub fn handle_tools(state: &mut AppState, pointer: &PointerFrame, ui_wants_mouse
                 }
             }
         }
+        if let Some(grab) = state.soft_grab_drag.take() {
+            soft_chain::release_soft_grab(&mut state.rig, &grab);
+        }
         state.clear_drags();
     }
 
@@ -388,6 +396,15 @@ pub fn handle_tools(state: &mut AppState, pointer: &PointerFrame, ui_wants_mouse
         return;
     }
 
+    if state.soft_grab_drag.is_some() {
+        if pointer.down {
+            if let Some(ref mut drag) = state.soft_grab_drag {
+                soft_chain::update_soft_grab(&state.scene, drag, rect, pointer.pos);
+            }
+        }
+        return;
+    }
+
     if ui_wants_mouse || !over || !pointer.pressed {
         return;
     }
@@ -436,6 +453,21 @@ pub fn handle_tools(state: &mut AppState, pointer: &PointerFrame, ui_wants_mouse
                     hit.mesh.index, hit.mesh.generation
                 );
             }
+        }
+        return;
+    }
+
+    // Soft Grab: pick soft-chain particle and soft-pin to cursor.
+    if state.rig.mode == AppMode::Pose && state.rig.tool == Tool::SoftGrab {
+        if let Some(drag) =
+            soft_chain::begin_soft_grab(&state.scene, &state.rig, rect, pointer.pos)
+        {
+            state.rig.set_selection(drag.bone);
+            state.edit_bone = None;
+            state.status = "Soft Grab…".into();
+            state.soft_grab_drag = Some(drag);
+        } else {
+            state.status = "Soft Grab: click a soft joint".into();
         }
         return;
     }
@@ -522,7 +554,7 @@ pub fn handle_tools(state: &mut AppState, pointer: &PointerFrame, ui_wants_mouse
                 }
                 return;
             }
-            Tool::Select | Tool::Brush => {}
+            Tool::Select | Tool::Brush | Tool::SoftGrab => {}
         }
     } else if state.rig.tool == Tool::AddBone {
         if let Some(hit) = gizmo::ray_ground_hit(&state.scene, rect, pointer.pos) {
@@ -582,7 +614,7 @@ pub fn default_dock() -> DockState {
         DockNode::leaf(&["Viewport"]),
         DockNode::split_v(
             0.58,
-            DockNode::leaf(&["Bones", "Shapes"]),
+            DockNode::leaf(&["Bones", "Shapes", "Lights"]),
             DockNode::leaf(&["Inspector"]),
         ),
     ))
@@ -657,6 +689,7 @@ impl Demo for RigApp {
                 let skel = ctx.state.rig.show_skeleton;
                 let mesh = ctx.state.rig.show_mesh;
                 let weights = ctx.state.rig.show_weights;
+                let colliders = ctx.state.rig.show_colliders;
                 if ui
                     .menu_item(if skel {
                         "Hide Skeleton"
@@ -685,6 +718,16 @@ impl Demo for RigApp {
                     ctx.state.rig.show_weights = !weights;
                     ctx.state.rig.invalidate_weight_overlay();
                 }
+                if ui
+                    .menu_item(if colliders {
+                        "Hide Colliders"
+                    } else {
+                        "Show Colliders"
+                    })
+                    .clicked()
+                {
+                    ctx.state.rig.show_colliders = !colliders;
+                }
             });
         });
 
@@ -712,6 +755,9 @@ impl Demo for RigApp {
             }
             "Shapes" => {
                 shapes_panel(ui, state);
+            }
+            "Lights" => {
+                lights_panel(ui, state);
             }
             "Inspector" => {
                 inspector_panel(ui, state);
@@ -759,7 +805,7 @@ fn viewport_toolbar(ui: &mut Ui, state: &mut AppState) {
                     Tool::Translate => 1,
                     Tool::Rotate => 2,
                     Tool::AddBone => 3,
-                    Tool::Brush => 0,
+                    Tool::Brush | Tool::SoftGrab => 0,
                 };
                 if ui
                     .toggle("tool_edit", &mut tool_i, &["Select", "Move", "Rotate", "Add"])
@@ -778,18 +824,27 @@ fn viewport_toolbar(ui: &mut Ui, state: &mut AppState) {
                 let mut tool_i = match state.rig.tool {
                     Tool::Translate => 1,
                     Tool::Rotate => 2,
+                    Tool::SoftGrab => 3,
                     _ => 0,
                 };
                 if ui
-                    .toggle("tool_pose", &mut tool_i, &["Select", "Move", "Rotate"])
+                    .toggle(
+                        "tool_pose",
+                        &mut tool_i,
+                        &["Select", "Move", "Rotate", "Grab"],
+                    )
                     .changed()
                 {
                     state.rig.tool = match tool_i {
                         1 => Tool::Translate,
                         2 => Tool::Rotate,
+                        3 => Tool::SoftGrab,
                         _ => Tool::Select,
                     };
                     state.clear_drags();
+                    if state.rig.tool == Tool::SoftGrab {
+                        state.status = "Tool: Soft Grab — drag soft joints".into();
+                    }
                 }
                 if state.rig.tool == Tool::Translate {
                     let mut move_i = match state.rig.move_mode {
@@ -866,6 +921,68 @@ fn viewport_toolbar(ui: &mut Ui, state: &mut AppState) {
                     _ => TransformSpace::Local,
                 };
                 state.clear_drags();
+            }
+        }
+    });
+}
+
+fn lights_panel(ui: &mut Ui, state: &mut AppState) {
+    ui.label_styled(
+        "Lights",
+        TextStyle {
+            color: [0.9, 0.9, 0.9, 1.0],
+            size: 14.0,
+        },
+    );
+    ui.separator();
+
+    let avail = ui.available_size();
+    ui.scroll_area("lights_scroll", avail, ScrollAxes::Vertical, |ui| {
+        ui.label("Ambient");
+        let _ = ui.slider("amb_r", &mut state.scene.ambient[0], 0.0..=1.0);
+        let _ = ui.slider("amb_g", &mut state.scene.ambient[1], 0.0..=1.0);
+        let _ = ui.slider("amb_b", &mut state.scene.ambient[2], 0.0..=1.0);
+        ui.separator();
+
+        for (i, light) in state.scene.lights.iter_mut().enumerate() {
+            match light {
+                Light::Directional(d) => {
+                    ui.label(&format!("Directional #{i}"));
+                    let _ = ui.checkbox(&format!("Enabled##dir_en_{i}"), &mut d.enabled);
+                    let _ = ui.checkbox(&format!("Shadows##dir_sh_{i}"), &mut d.cast_shadows);
+                    ui.label("Direction X / Y / Z");
+                    let _ = ui.slider(&format!("dir_x_{i}"), &mut d.direction.x, -1.0..=1.0);
+                    let _ = ui.slider(&format!("dir_y_{i}"), &mut d.direction.y, -1.0..=1.0);
+                    let _ = ui.slider(&format!("dir_z_{i}"), &mut d.direction.z, -1.0..=1.0);
+                    d.direction = d.direction.normalize_or_zero();
+                    if d.direction.length_squared() < 1e-8 {
+                        d.direction = Vec3::new(0.35, -0.55, 0.75).normalize();
+                    }
+                    ui.label("Intensity");
+                    let _ = ui.slider(&format!("dir_int_{i}"), &mut d.intensity, 0.0..=10.0);
+                    ui.label("Color R / G / B");
+                    let _ = ui.slider(&format!("dir_cr_{i}"), &mut d.color[0], 0.0..=1.0);
+                    let _ = ui.slider(&format!("dir_cg_{i}"), &mut d.color[1], 0.0..=1.0);
+                    let _ = ui.slider(&format!("dir_cb_{i}"), &mut d.color[2], 0.0..=1.0);
+                    ui.separator();
+                }
+                Light::Point(p) => {
+                    ui.label(&format!("Point #{i}"));
+                    let _ = ui.checkbox(&format!("Enabled##pt_en_{i}"), &mut p.enabled);
+                    ui.label("Position X / Y / Z");
+                    let _ = ui.slider(&format!("pt_x_{i}"), &mut p.position.x, -10.0..=10.0);
+                    let _ = ui.slider(&format!("pt_y_{i}"), &mut p.position.y, -10.0..=10.0);
+                    let _ = ui.slider(&format!("pt_z_{i}"), &mut p.position.z, -10.0..=10.0);
+                    ui.label("Intensity");
+                    let _ = ui.slider(&format!("pt_int_{i}"), &mut p.intensity, 0.0..=20.0);
+                    ui.label("Range");
+                    let _ = ui.slider(&format!("pt_range_{i}"), &mut p.range, 0.1..=30.0);
+                    ui.label("Color R / G / B");
+                    let _ = ui.slider(&format!("pt_cr_{i}"), &mut p.color[0], 0.0..=1.0);
+                    let _ = ui.slider(&format!("pt_cg_{i}"), &mut p.color[1], 0.0..=1.0);
+                    let _ = ui.slider(&format!("pt_cb_{i}"), &mut p.color[2], 0.0..=1.0);
+                    ui.separator();
+                }
             }
         }
     });
@@ -1419,23 +1536,29 @@ fn inspector_panel_body(ui: &mut Ui, state: &mut AppState) {
                 if let Some(c) = state.rig.colliders.iter_mut().find(|c| c.id == cid) {
                     let _ = ui.checkbox(&format!("Enabled##col_en_{cid}"), &mut c.enabled);
                     ui.label("Radius");
-                    let _ = ui.slider(&format!("col_r_{cid}"), &mut c.radius, 0.005..=2.0);
+                    if ui
+                        .drag_float(&format!("col_r_{cid}"), &mut c.radius, 0.001)
+                        .changed()
+                    {
+                        c.radius = c.radius.clamp(0.001, 0.5);
+                    }
                     ui.label("Length");
                     let mut len = c.length();
                     let mut off = c.axis_offset();
                     if ui
-                        .slider(&format!("col_l_{cid}"), &mut len, 0.01..=3.0)
+                        .drag_float(&format!("col_l_{cid}"), &mut len, 0.001)
                         .changed()
                     {
-                        c.set_length_offset(len, off);
+                        c.set_length_offset(len.clamp(0.001, 1.0), off.clamp(-0.5, 0.5));
                     }
                     ui.label("Offset along axis");
                     len = c.length();
+                    off = c.axis_offset();
                     if ui
-                        .slider(&format!("col_o_{cid}"), &mut off, -2.0..=2.0)
+                        .slider(&format!("col_o_{cid}"), &mut off, -0.5..=0.5)
                         .changed()
                     {
-                        c.set_length_offset(len.max(0.01), off);
+                        c.set_length_offset(len.max(0.001), off);
                     }
                     ui.label("Softness (0=jelly, 1=firmer)");
                     let _ = ui.slider(&format!("col_s_{cid}"), &mut c.softness, 0.0..=1.0);
