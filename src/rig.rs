@@ -150,6 +150,9 @@ pub struct SoftChain {
     pub stiffness: f32,
     /// Velocity decay rate (1/s). Frame-rate independent.
     pub damping: f32,
+    /// How much motion trails the soft root (0 = glued, 1 = normal, >1 = exaggerated).
+    /// Uses stable positional lag + accel response; safe with constraint absorb.
+    pub inertia: f32,
     /// Radians from animated rest direction.
     pub max_angle: f32,
     /// Runtime Verlet state (world). Includes virtual tip as last particle.
@@ -157,6 +160,8 @@ pub struct SoftChain {
     pub(crate) curr_pos: Vec<Vec3>,
     /// Previous frame world matrix of soft root (`bones[0]`) for motion inheritance.
     pub(crate) prev_root_world: glam::Mat4,
+    /// Soft-root world velocity (for inertia / fictitious force).
+    pub(crate) prev_root_vel: Vec3,
     pub(crate) initialized: bool,
 }
 
@@ -793,11 +798,13 @@ impl RigDocument {
             enabled: true,
             gravity: 9.8,
             stiffness: 45.0,
-            damping: 6.0,
+            damping: 2.5,
+            inertia: 0.0,
             max_angle: 95f32.to_radians(),
             prev_pos: Vec::new(),
             curr_pos: Vec::new(),
             prev_root_world: glam::Mat4::IDENTITY,
+            prev_root_vel: Vec3::ZERO,
             initialized: false,
         });
         Ok(id)

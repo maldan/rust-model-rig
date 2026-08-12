@@ -1372,6 +1372,8 @@ fn inspector_panel_body(ui: &mut Ui, state: &mut AppState) {
                 let _ = ui.slider(&format!("soft_k_{cid}"), &mut c.stiffness, 0.0..=200.0);
                 ui.label("Damping (1/s)");
                 let _ = ui.slider(&format!("soft_d_{cid}"), &mut c.damping, 0.0..=40.0);
+                ui.label("Inertia (move lag)");
+                let _ = ui.slider(&format!("soft_i_{cid}"), &mut c.inertia, 0.0..=20.0);
                 ui.label("Max angle (°)");
                 let mut deg = c.max_angle.to_degrees();
                 if ui

@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use crate::ik::quat_from_matrix;
 use crate::rig::{AppMode, BoneId, RigDocument, SoftChain};
 
-const CONSTRAINT_ITERS: u32 = 8;
+const CONSTRAINT_ITERS: u32 = 6;
 const SUBSTEPS: u32 = 4;
 
 /// Run all enabled soft chains (Pose only). Call after IK.
@@ -78,20 +78,66 @@ fn solve_chain(scene: &mut Scene, chain: &mut SoftChain, dt: f32) {
     }
 
     let root_world = scene.world_matrix(chain.bones[0].node);
+    let (_, _, curr_t) = root_world.to_scale_rotation_translation();
+
+    // Extra accel from root motion (start/stop punch). Continuous move lag is
+    // handled as a positional trail after inheritance (see below).
+    let mut fictitious = Vec3::ZERO;
 
     if !chain.initialized || chain.curr_pos.len() != n {
         chain.prev_pos = rest.clone();
         chain.curr_pos = rest.clone();
         chain.prev_root_world = root_world;
+        chain.prev_root_vel = Vec3::ZERO;
         chain.initialized = true;
     } else {
-        // Motion inheritance: move/rotate particles with the soft root so body
-        // animation isn't treated as a teleport (fixes thrashing while posing).
-        let delta = root_world * chain.prev_root_world.inverse();
-        for i in 1..n {
-            chain.curr_pos[i] = delta.transform_point3(chain.curr_pos[i]);
-            chain.prev_pos[i] = delta.transform_point3(chain.prev_pos[i]);
+        let (_, _, prev_t) = chain.prev_root_world.to_scale_rotation_translation();
+        let trans = curr_t - prev_t;
+        let dt_safe = dt.max(1e-4);
+        let root_vel = trans / dt_safe;
+        let mut root_accel = (root_vel - chain.prev_root_vel) / dt_safe;
+        chain.prev_root_vel = root_vel;
+
+        let scale: f32 = chain.lengths.iter().copied().sum::<f32>() + chain.tip_length;
+        let inertia = chain.inertia.clamp(0.0, 20.0);
+        // Only hard-reset on true teleports; normal walk/gizmo speeds must not snap.
+        let teleport = trans.length() > (scale * 2.5).max(0.2);
+
+        if teleport {
+            chain.prev_pos = rest.clone();
+            chain.curr_pos = rest.clone();
+            chain.prev_root_vel = Vec3::ZERO;
+            root_accel = Vec3::ZERO;
+        } else {
+            let delta = root_world * chain.prev_root_world.inverse();
+            for i in 1..n {
+                chain.curr_pos[i] = delta.transform_point3(chain.curr_pos[i]);
+                chain.prev_pos[i] = delta.transform_point3(chain.prev_pos[i]);
+            }
+
+            // Stable move trail: same world shift on curr and prev (no fake Verlet
+            // velocity). Constraints absorb corrections, so this no longer thrashes.
+            // inertia>1 scales the trail; max_lag grows so higher values stay visible.
+            let t_len = trans.length();
+            if inertia > 1e-6 && t_len > 1e-8 {
+                let max_lag = (scale * 0.4 * inertia.max(1.0)).max(0.012);
+                let mut lag = trans * inertia;
+                if lag.length() > max_lag {
+                    lag = lag.normalize() * max_lag;
+                }
+                for i in 1..n {
+                    chain.curr_pos[i] -= lag;
+                    chain.prev_pos[i] -= lag;
+                }
+            }
         }
+
+        let max_a = ((scale * 80.0).max(15.0)).min(100.0);
+        if root_accel.length_squared() > max_a * max_a {
+            root_accel = root_accel.normalize() * max_a;
+        }
+        fictitious = -root_accel * inertia;
+
         chain.prev_root_world = root_world;
     }
 
@@ -133,13 +179,13 @@ fn solve_chain(scene: &mut Scene, chain: &mut SoftChain, dt: f32) {
         }
     };
 
+    let accel = gravity + fictitious;
+
     for _ in 0..SUBSTEPS {
         chain.curr_pos[0] = rest[0];
         chain.prev_pos[0] = rest[0];
 
         for i in 1..n {
-            // Spring toward bind direction from the *current* parent particle
-            // (not absolute rest world pos — that shears the chain and bends kids weirdly).
             let parent = chain.curr_pos[i - 1];
             let rest_target = if rest_dir[i].length_squared() > 1e-8 {
                 parent + rest_dir[i] * seg_len[i]
@@ -149,7 +195,7 @@ fn solve_chain(scene: &mut Scene, chain: &mut SoftChain, dt: f32) {
 
             let vel = chain.curr_pos[i] - chain.prev_pos[i];
             let spring = (rest_target - chain.curr_pos[i]) * stiff;
-            let next = chain.curr_pos[i] + vel * vel_keep + (gravity + spring) * h2;
+            let next = chain.curr_pos[i] + vel * vel_keep + (accel + spring) * h2;
             chain.prev_pos[i] = chain.curr_pos[i];
             chain.curr_pos[i] = next;
         }
@@ -161,49 +207,18 @@ fn solve_chain(scene: &mut Scene, chain: &mut SoftChain, dt: f32) {
                 let parent = chain.curr_pos[i - 1];
                 let len = seg_len[i];
                 let rd = rest_dir[i];
+                let old = chain.curr_pos[i];
 
-                let mut p = project_length(chain.curr_pos[i], parent, len, rd, support_n);
+                let mut p = project_length(old, parent, len, rd, support_n);
 
                 // Support half-space: stay outside the chest.
                 let side = (p - plane_p).dot(support_n);
                 if side < 0.0 {
                     p += support_n * (-side);
                     p = project_length(p, parent, len, rd, support_n);
-
-                    // Prefer the rest direction flattened onto the plane when gravity
-                    // is pushing into the body (lying on back) — avoids random sideways slides.
-                    if rd.length_squared() > 1e-8 {
-                        let mut prefer = rd - support_n * rd.dot(support_n);
-                        if prefer.length_squared() < 1e-10 {
-                            // Rest is along the normal; pick a stable tangent from gravity.
-                            prefer = gravity - support_n * gravity.dot(support_n);
-                        }
-                        if prefer.length_squared() > 1e-10 {
-                            let into = (p - parent).dot(support_n);
-                            if into < 1e-4 {
-                                let tang = prefer.normalize();
-                                // Blend toward in-plane rest so kids don't crab-walk.
-                                let cur = (p - parent).normalize_or_zero();
-                                let blended = (cur + tang * 0.35).normalize_or_zero();
-                                if blended.length_squared() > 1e-8 {
-                                    p = parent + blended * len;
-                                    p = clamp_to_halfspace(p, plane_p, support_n);
-                                    p = project_length(p, parent, len, rd, support_n);
-                                }
-                            }
-                        }
-                    }
-
-                    // Kill velocity into the plane (stop buzzing / tunneling feel).
-                    let vel = chain.curr_pos[i] - chain.prev_pos[i];
-                    let vn = vel.dot(support_n);
-                    if vn < 0.0 {
-                        let v_tang = vel - support_n * vn;
-                        chain.prev_pos[i] = p - v_tang;
-                    }
                 }
 
-                // Angle cone around *bind segment* direction (not rest[i]-curr[i-1]).
+                // Hard angle cone (snappy — soft compliance felt viscous).
                 if rd.length_squared() > 1e-8 {
                     let mut dir = (p - parent).normalize_or_zero();
                     if dir.length_squared() > 1e-8 {
@@ -218,7 +233,6 @@ fn solve_chain(scene: &mut Scene, chain: &mut SoftChain, dt: f32) {
                             } else {
                                 p = parent + rd * len;
                             }
-                            // Keep outside chest after angle clamp.
                             p = clamp_to_halfspace(p, plane_p, support_n);
                             p = project_length(p, parent, len, rd, support_n);
                         }
@@ -226,15 +240,33 @@ fn solve_chain(scene: &mut Scene, chain: &mut SoftChain, dt: f32) {
                 }
 
                 chain.curr_pos[i] = p;
+
+                // Shock absorber only: big constraint jumps (from move-lag / hits)
+                // would inject Verlet velocity and thrash. Tiny corrections stay
+                // live so the chain keeps bounce instead of feeling like goo.
+                let corr = p - old;
+                let clen = corr.length();
+                let shock = (len * 0.2).max(1e-4);
+                if clen > shock {
+                    chain.prev_pos[i] += corr * ((clen - shock) / clen);
+                }
+
+                // Kill into-plane velocity on contact.
+                if (p - plane_p).dot(support_n) < 1e-4 {
+                    let vel = chain.curr_pos[i] - chain.prev_pos[i];
+                    let vn = vel.dot(support_n);
+                    if vn < 0.0 {
+                        chain.prev_pos[i] = p - (vel - support_n * vn);
+                    }
+                }
             }
         }
     }
 
     // Write rotations from particle chain (each bone aims at the next particle).
     for i in 0..n_bones {
-        let target = chain.curr_pos[i + 1];
         if i + 1 < n_bones {
-            swing_bone_to(scene, chain.bones[i], chain.bones[i + 1], target);
+            swing_bone_to(scene, chain.bones[i], chain.bones[i + 1], chain.curr_pos[i + 1]);
         } else {
             let tip = chain.bones[i];
             let m = scene.world_matrix(tip.node);
@@ -286,7 +318,13 @@ fn apply_swing(scene: &mut Scene, bone: BoneId, from: Vec3, to: Vec3) {
     if dot > 0.999999 {
         return;
     }
-    let q = Quat::from_rotation_arc(from, to);
+    let q = if dot < -0.999999 {
+        // 180°: from_rotation_arc is unstable — pick a stable axis.
+        let axis = from.any_orthonormal_vector();
+        Quat::from_axis_angle(axis, std::f32::consts::PI)
+    } else {
+        Quat::from_rotation_arc(from, to)
+    };
     apply_world_delta_rot(scene, bone, q);
 }
 
