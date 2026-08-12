@@ -38,6 +38,23 @@ impl DriverSpace {
             DriverSpace::BindOffset => "Offset",
         }
     }
+
+    pub fn from_name(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "local" => Some(Self::Local),
+            "world" => Some(Self::World),
+            "offset" | "bind_offset" | "bindoffset" => Some(Self::BindOffset),
+            _ => None,
+        }
+    }
+
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::World => "world",
+            Self::BindOffset => "offset",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,6 +115,99 @@ impl DriverNodeKind {
             DriverNodeKind::QuatInvert => "Quat Invert",
             DriverNodeKind::QuatScale => "Quat Scale",
             DriverNodeKind::QuatAngle => "Quat Angle",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<Self> {
+        let mut k = s.trim().to_ascii_lowercase();
+        k = k.replace('→', "to");
+        k = k.replace('×', "x");
+        k = k.replace([' ', '-'], "_");
+        while k.contains("__") {
+            k = k.replace("__", "_");
+        }
+        match k.as_str() {
+            "bone_get" | "get_bone" => Some(Self::BoneGet),
+            "bone_set" | "set_bone" => Some(Self::BoneSet),
+            "morph_set" | "set_morph" => Some(Self::MorphSet),
+            "float" => Some(Self::Float),
+            "vec3" => Some(Self::Vec3),
+            "quat_euler" | "quateuler" => Some(Self::QuatEuler),
+            "quat_to_euler" | "quat_euler_out" => Some(Self::QuatToEuler),
+            "remap" => Some(Self::Remap),
+            "map_range" | "maprange" => Some(Self::MapRange),
+            "clamp" => Some(Self::Clamp),
+            "add" => Some(Self::Add),
+            "mul" | "multiply" => Some(Self::Mul),
+            "combine_vec3" | "combine_xyz" | "combinexyz" => Some(Self::CombineVec3),
+            "split_vec3" | "split_xyz" | "splitxyz" => Some(Self::SplitVec3),
+            "vec3_add" => Some(Self::Vec3Add),
+            "vec3_scale" => Some(Self::Vec3Scale),
+            "vec3_length" | "length" => Some(Self::Vec3Length),
+            "vec3_normalize" | "normalize" => Some(Self::Vec3Normalize),
+            "quat_mul" => Some(Self::QuatMul),
+            "quat_rotate_vec" | "quat_x_vec" => Some(Self::QuatRotateVec),
+            "quat_invert" => Some(Self::QuatInvert),
+            "quat_scale" => Some(Self::QuatScale),
+            "quat_angle" => Some(Self::QuatAngle),
+            _ => None,
+        }
+    }
+
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::BoneGet => "bone_get",
+            Self::BoneSet => "bone_set",
+            Self::MorphSet => "morph_set",
+            Self::Float => "float",
+            Self::Vec3 => "vec3",
+            Self::QuatEuler => "quat_euler",
+            Self::QuatToEuler => "quat_to_euler",
+            Self::Remap => "remap",
+            Self::MapRange => "map_range",
+            Self::Clamp => "clamp",
+            Self::Add => "add",
+            Self::Mul => "mul",
+            Self::CombineVec3 => "combine_vec3",
+            Self::SplitVec3 => "split_vec3",
+            Self::Vec3Add => "vec3_add",
+            Self::Vec3Scale => "vec3_scale",
+            Self::Vec3Length => "vec3_length",
+            Self::Vec3Normalize => "vec3_normalize",
+            Self::QuatMul => "quat_mul",
+            Self::QuatRotateVec => "quat_rotate_vec",
+            Self::QuatInvert => "quat_invert",
+            Self::QuatScale => "quat_scale",
+            Self::QuatAngle => "quat_angle",
+        }
+    }
+
+    pub fn output_port_type(self, port: &str) -> u16 {
+        use mega_ui::port_type::{ANY, FLOAT, QUAT, VEC3};
+        match (self, port) {
+            (Self::BoneGet, "pos" | "scale") => VEC3,
+            (Self::BoneGet, "rot") => QUAT,
+            (Self::Float, "value") => FLOAT,
+            (Self::Vec3, "v") => VEC3,
+            (Self::QuatEuler, "q") => QUAT,
+            (Self::QuatToEuler, "euler") => VEC3,
+            (Self::QuatToEuler, "x" | "y" | "z") => FLOAT,
+            (
+                Self::Remap | Self::MapRange | Self::Clamp | Self::Add | Self::Mul | Self::Vec3Length
+                | Self::QuatAngle,
+                "out",
+            ) => FLOAT,
+            (
+                Self::CombineVec3
+                | Self::Vec3Add
+                | Self::Vec3Scale
+                | Self::Vec3Normalize
+                | Self::QuatRotateVec,
+                "out",
+            ) => VEC3,
+            (Self::SplitVec3, "x" | "y" | "z") => FLOAT,
+            (Self::QuatMul | Self::QuatInvert | Self::QuatScale, "out") => QUAT,
+            _ => ANY,
         }
     }
 }
@@ -230,6 +340,42 @@ impl Driver {
         self.next_node_serial += 1;
         self.nodes.push(DriverNode::new(id.clone(), kind, pos));
         id
+    }
+
+    pub fn node_mut(&mut self, id: &str) -> Option<&mut DriverNode> {
+        self.nodes.iter_mut().find(|n| n.id == id)
+    }
+
+    pub fn connect(
+        &mut self,
+        from: &str,
+        from_port: &str,
+        to: &str,
+        to_port: &str,
+    ) -> Result<(), String> {
+        let from_kind = self
+            .nodes
+            .iter()
+            .find(|n| n.id == from)
+            .map(|n| n.kind)
+            .ok_or_else(|| format!("unknown node '{from}'"))?;
+        if !self.nodes.iter().any(|n| n.id == to) {
+            return Err(format!("unknown node '{to}'"));
+        }
+        self.space
+            .links
+            .retain(|l| !(l.to_node == to && l.to_port == to_port));
+        let id = self.space.next_link_id;
+        self.space.next_link_id += 1;
+        self.space.links.push(NodeLink {
+            id,
+            from_node: from.to_string(),
+            from_port: from_port.to_string(),
+            to_node: to.to_string(),
+            to_port: to_port.to_string(),
+            ty: from_kind.output_port_type(from_port),
+        });
+        Ok(())
     }
 
     pub fn apply_deletes(&mut self) {

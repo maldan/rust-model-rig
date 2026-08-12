@@ -137,24 +137,38 @@ impl AppState {
         let Some(path) = path else {
             return;
         };
-        match self.rig.load_path(&mut self.scene, &path) {
-            Ok(()) => {
-                // Pose editor: strip clips so nothing overwrites FK.
-                self.scene.animators.clear();
-                self.reset_session_state();
-                let with_parent = self.rig.bones.iter().filter(|b| b.parent.is_some()).count();
-                self.status = format!(
-                    "Loaded {} · {} bones ({} with parent) · Pose mode",
-                    path.file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("model"),
-                    self.rig.bones.len(),
-                    with_parent
-                );
-            }
-            Err(e) => {
-                self.status = format!("Load failed: {e}");
-            }
+        match self.load_model(&path) {
+            Ok(msg) => self.status = msg,
+            Err(e) => self.status = format!("Load failed: {e}"),
+        }
+    }
+
+    pub fn load_model(&mut self, path: &std::path::Path) -> Result<String, String> {
+        self.rig.load_path(&mut self.scene, path)?;
+        // Pose editor: strip clips so nothing overwrites FK.
+        self.scene.animators.clear();
+        self.reset_session_state();
+        let with_parent = self.rig.bones.iter().filter(|b| b.parent.is_some()).count();
+        Ok(format!(
+            "Loaded {} · {} bones ({} with parent) · Pose mode",
+            path.file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("model"),
+            self.rig.bones.len(),
+            with_parent
+        ))
+    }
+
+    pub fn run_script_dialog(&mut self) {
+        let path = rfd::FileDialog::new()
+            .add_filter("Lua", &["lua"])
+            .pick_file();
+        let Some(path) = path else {
+            return;
+        };
+        match crate::script::run_file(self, &path) {
+            Ok(msg) => self.status = msg,
+            Err(e) => self.status = format!("Script failed: {e}"),
         }
     }
 
@@ -685,6 +699,9 @@ impl Demo for RigApp {
                 }
                 if ui.menu_item_icon("folder_open", "Open…").clicked() {
                     ctx.state.open_dialog();
+                }
+                if ui.menu_item("Run Script…").clicked() {
+                    ctx.state.run_script_dialog();
                 }
                 if ui.menu_item("Reset pose").clicked() {
                     ctx.state.rig.reset_pose(&mut ctx.state.scene);
@@ -1559,6 +1576,13 @@ fn driver_editor_window(ui: &mut Ui, state: &mut AppState) {
                         }
                         driver.space.request_delete_nodes.extend(ids);
                         status_msg = Some(format!("Delete {sel_n} node(s)"));
+                    }
+                }
+                if ui.button("Copy Lua").clicked() {
+                    let lua = crate::script::driver_to_lua(driver, &bone_list);
+                    match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(lua)) {
+                        Ok(()) => status_msg = Some("Lua macro copied to clipboard".into()),
+                        Err(e) => status_msg = Some(format!("Clipboard failed: {e}")),
                     }
                 }
             });

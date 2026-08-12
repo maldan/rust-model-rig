@@ -1,5 +1,6 @@
 //! Winit + wgpu host for model-rig (adapted from mega-render examples/framework).
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -414,8 +415,17 @@ pub struct Host<D: Demo> {
 }
 
 impl<D: Demo> Host<D> {
-    fn new(dock: DockState) -> Self {
-        let state = D::build_state();
+    fn new(dock: DockState, script: Option<PathBuf>) -> Self {
+        let mut state = D::build_state();
+        if let Some(path) = script {
+            match crate::script::run_file(&mut state, &path) {
+                Ok(msg) => state.status = msg,
+                Err(e) => {
+                    log::error!("script: {e}");
+                    state.status = format!("Script failed: {e}");
+                }
+            }
+        }
         let orbit = OrbitCam::from_scene(&state.scene);
         let mut ui = Ui::new();
         D::init_ui(&mut ui);
@@ -443,11 +453,11 @@ impl<D: Demo> Host<D> {
         }
     }
 
-    pub fn run(dock: DockState) {
+    pub fn run(dock: DockState, script: Option<PathBuf>) {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
         let event_loop = EventLoop::new().expect("event loop");
         event_loop.set_control_flow(ControlFlow::Poll);
-        let mut host = Self::new(dock);
+        let mut host = Self::new(dock, script);
         event_loop.run_app(&mut host).expect("run app");
     }
 

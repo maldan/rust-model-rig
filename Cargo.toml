@@ -14,6 +14,7 @@ env_logger = "0.11"
 log = "0.4"
 arboard = "3"
 rfd = "0.15"
+mlua = { version = "0.11", features = ["lua54", "vendored"] }
 
 [target.'cfg(windows)'.dependencies]
 # Keep in sync with mega-ui / wgpu-hal (see mega-ui Cargo.toml).

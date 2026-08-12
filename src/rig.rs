@@ -50,6 +50,17 @@ pub enum AppMode {
     Shape,
 }
 
+impl AppMode {
+    pub fn from_name(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "edit" => Some(Self::Edit),
+            "pose" => Some(Self::Pose),
+            "shape" | "shape_keys" => Some(Self::Shape),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Tool {
     #[default]
@@ -1223,6 +1234,10 @@ impl RigDocument {
             }
         }
         self.invalidate_weight_overlay();
+    }
+
+    pub fn bone_by_name(&self, name: &str) -> Option<BoneId> {
+        self.bones.iter().find(|b| b.name == name).map(|b| b.id)
     }
 
     pub fn bone(&self, id: BoneId) -> Option<&BoneInfo> {
