@@ -18,6 +18,7 @@ use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use crate::app::{handle_tools, AppState, PointerFrame};
+use crate::driver::{evaluate_drivers, DriverPass};
 use crate::gizmo;
 use crate::ik_chain::{draw_ik_helpers, evaluate_ik_chains};
 use crate::rig::{draw_rig_debug, draw_weight_debug, AppMode, Tool};
@@ -292,6 +293,7 @@ struct FrameInput {
     scroll_delta: Vec2,
     text: String,
     key_backspace: bool,
+    key_delete: bool,
     key_enter: bool,
     key_left: bool,
     key_right: bool,
@@ -305,6 +307,7 @@ struct FrameInput {
     key_paste: bool,
     key_cut: bool,
     key_select_all: bool,
+    key_duplicate: bool,
     modifiers: winit::keyboard::ModifiersState,
     clipboard_paste: String,
 }
@@ -320,6 +323,7 @@ impl FrameInput {
         self.scroll_delta = Vec2::ZERO;
         self.text.clear();
         self.key_backspace = false;
+        self.key_delete = false;
         self.key_enter = false;
         self.key_left = false;
         self.key_right = false;
@@ -331,6 +335,7 @@ impl FrameInput {
         self.key_paste = false;
         self.key_cut = false;
         self.key_select_all = false;
+        self.key_duplicate = false;
         self.clipboard_paste.clear();
     }
 
@@ -347,11 +352,15 @@ impl FrameInput {
             mouse_right_down: self.mouse_right_down,
             mouse_right_pressed: self.mouse_right_pressed,
             mouse_right_released: self.mouse_right_released,
+            mouse_middle_down: self.mouse_middle_down,
+            mouse_middle_pressed: self.mouse_middle_pressed,
+            mouse_middle_released: self.mouse_middle_released,
             viewport,
             scroll_delta: self.scroll_delta,
             dt,
             text: self.text.clone(),
             key_backspace: self.key_backspace,
+            key_delete: self.key_delete,
             key_enter: self.key_enter,
             key_left: self.key_left,
             key_right: self.key_right,
@@ -365,6 +374,7 @@ impl FrameInput {
             key_paste: self.key_paste,
             key_cut: self.key_cut,
             key_select_all: self.key_select_all,
+            key_duplicate: self.key_duplicate,
             clipboard: self.clipboard_paste.clone(),
         }
     }
@@ -598,9 +608,12 @@ impl<D: Demo> Host<D> {
         }
 
         let scroll = self.input.scroll_delta.y;
+        let over_ui = self.ui.pointer_over_window_at(self.input.mouse_pos)
+            || self.ui.pointer_over_popup_at(self.input.mouse_pos);
         if scroll.abs() > 0.0
             && !self.state.has_drag()
             && self.state.rig.viewport_rect.contains(self.input.mouse_pos)
+            && !over_ui
         {
             self.orbit.add_zoom(scroll);
         }
@@ -686,6 +699,11 @@ impl<D: Demo> Host<D> {
                 }
 
                 if !consumed {
+                    let over_window = self.ui.pointer_over_window_at(mouse);
+                    let over_popup = self.ui.pointer_over_popup_at(mouse);
+                    let ui_blocks = over_window
+                        || over_popup
+                        || (out.want_capture_mouse && !vp_rect.contains(mouse));
                     handle_tools(
                         &mut self.state,
                         &PointerFrame {
@@ -695,12 +713,14 @@ impl<D: Demo> Host<D> {
                             released: self.input.mouse_released,
                             ctrl: self.input.shortcut_mod(),
                         },
-                        out.want_capture_mouse && !vp_rect.contains(mouse),
+                        ui_blocks,
                     );
                 }
             }
 
-            // Pose IK: solve after tools so targets moved this frame apply.
+            // Drivers that write IK parents (clavicle…) first — from last frame's pose.
+            evaluate_drivers(&mut self.state.scene, &mut self.state.rig, DriverPass::PreIk);
+            // Pose IK: solve after tools / pre-drivers so targets & parents are set.
             evaluate_ik_chains(&mut self.state.scene, &self.state.rig);
             // Soft chains: after IK so they inherit body / limb motion.
             evaluate_soft_chains(
@@ -709,6 +729,8 @@ impl<D: Demo> Host<D> {
                 dt,
                 self.state.soft_grab_drag.as_ref(),
             );
+            // Post-IK drivers: morphs, twist, non-ancestor bones.
+            evaluate_drivers(&mut self.state.scene, &mut self.state.rig, DriverPass::PostIk);
 
             // Debug / gizmo after tools so pose matches this frame.
             self.state.scene.debug.clear();
@@ -995,6 +1017,8 @@ impl<D: Demo> ApplicationHandler for Host<D> {
                     );
                 let nav_ok = !self.state.has_drag()
                     && !over_view_gizmo
+                    && !self.ui.pointer_over_window_at(self.input.mouse_pos)
+                    && !self.ui.pointer_over_popup_at(self.input.mouse_pos)
                     && (!self.want_capture_mouse || over_vp);
                 match button {
                     MouseButton::Left => {
@@ -1183,6 +1207,7 @@ impl<D: Demo> ApplicationHandler for Host<D> {
                     let shortcut = self.input.shortcut_mod();
                     match &event.logical_key {
                         Key::Named(NamedKey::Backspace) => self.input.key_backspace = true,
+                        Key::Named(NamedKey::Delete) => self.input.key_delete = true,
                         Key::Named(NamedKey::Enter) => self.input.key_enter = true,
                         Key::Named(NamedKey::ArrowLeft) => self.input.key_left = true,
                         Key::Named(NamedKey::ArrowRight) => self.input.key_right = true,
@@ -1195,6 +1220,7 @@ impl<D: Demo> ApplicationHandler for Host<D> {
                             "v" => self.begin_paste(),
                             "x" => self.input.key_cut = true,
                             "a" => self.input.key_select_all = true,
+                            "d" => self.input.key_duplicate = true,
                             _ => {}
                         },
                         _ => {}
@@ -1206,6 +1232,7 @@ impl<D: Demo> ApplicationHandler for Host<D> {
                                 KeyCode::KeyV => self.begin_paste(),
                                 KeyCode::KeyX => self.input.key_cut = true,
                                 KeyCode::KeyA => self.input.key_select_all = true,
+                                KeyCode::KeyD => self.input.key_duplicate = true,
                                 _ => {}
                             }
                         }

@@ -235,6 +235,8 @@ pub struct RigDocument {
     pub soft_chains: Vec<SoftChain>,
     /// Soft capsule colliders on bones (body / breast volume, etc.).
     pub colliders: Vec<BoneCollider>,
+    /// Node-graph drivers (bone/morph I/O). Evaluated in Pose.
+    pub drivers: Vec<crate::driver::Driver>,
     /// Mesh used for shape-key editing.
     pub active_mesh: Option<Handle<Mesh>>,
     /// Active morph target index on `active_mesh`.
@@ -252,6 +254,7 @@ pub struct RigDocument {
     next_soft_serial: u32,
     next_collider_serial: u32,
     next_shape_serial: u32,
+    next_driver_serial: u32,
 }
 
 impl Default for RigDocument {
@@ -276,6 +279,7 @@ impl Default for RigDocument {
             ik_chains: Vec::new(),
             soft_chains: Vec::new(),
             colliders: Vec::new(),
+            drivers: Vec::new(),
             active_mesh: None,
             active_shape: None,
             brush_radius: 0.08,
@@ -290,6 +294,7 @@ impl Default for RigDocument {
             next_soft_serial: 1,
             next_collider_serial: 1,
             next_shape_serial: 1,
+            next_driver_serial: 1,
         }
     }
 }
@@ -403,6 +408,7 @@ impl RigDocument {
         self.ik_chains.clear();
         self.soft_chains.clear();
         self.colliders.clear();
+        self.drivers.clear();
         self.active_mesh = None;
         self.active_shape = None;
         self.brush_radius = 0.08;
@@ -413,6 +419,7 @@ impl RigDocument {
         self.next_soft_serial = 1;
         self.next_collider_serial = 1;
         self.next_shape_serial = 1;
+        self.next_driver_serial = 1;
         self.weight_overlay.clear();
         self.show_weights = false;
         self.move_mode = MoveMode::Fk;
@@ -488,11 +495,36 @@ impl RigDocument {
             return;
         };
         mesh.remove_shape_key(idx);
+        self.on_shape_removed(mesh_h, idx);
         self.active_shape = if mesh.morph_targets.is_empty() {
             None
         } else {
             Some(idx.min(mesh.morph_targets.len() - 1))
         };
+    }
+
+    /// Clear / reindex morph refs in driver graphs when a morph target is removed.
+    pub fn on_shape_removed(&mut self, mesh: Handle<Mesh>, index: usize) {
+        for d in &mut self.drivers {
+            d.on_shape_removed(mesh, index);
+        }
+    }
+
+    /// Create an empty named driver graph.
+    pub fn create_driver(&mut self) -> u32 {
+        let id = self.next_driver_serial;
+        self.next_driver_serial += 1;
+        let name = format!("Driver {id}");
+        self.drivers.push(crate::driver::Driver::new(id, name));
+        id
+    }
+
+    pub fn remove_driver(&mut self, id: u32) {
+        self.drivers.retain(|d| d.id != id);
+    }
+
+    pub fn driver_mut(&mut self, id: u32) -> Option<&mut crate::driver::Driver> {
+        self.drivers.iter_mut().find(|d| d.id == id)
     }
 
     pub fn write_bind_for(&mut self, scene: &Scene, id: BoneId) {
@@ -579,6 +611,9 @@ impl RigDocument {
         });
         self.colliders
             .retain(|c| !kill_set.contains(&c.bone.node.key()));
+        for d in &mut self.drivers {
+            d.clear_bone_refs(&kill_set);
+        }
 
         // Detach from surviving parents' children lists.
         for b in &mut self.bones {

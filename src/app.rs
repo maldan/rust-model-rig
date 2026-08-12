@@ -2,8 +2,11 @@
 
 use glam::{Vec2, Vec3};
 use mega_render::{GizmoAxis, Light, Scene, SkinningMode, Visualizer, WgpuVisualizer};
-use mega_ui::{DockNode, DockState, ScrollAxes, TextStyle, Ui};
+use mega_ui::{
+    port_type, DockNode, DockState, NodePortSide, ScrollAxes, TextStyle, Ui, Window,
+};
 
+use crate::driver::{DriverNodeKind, DriverSpace};
 use crate::framework::{Demo, UiCtx, SCENE_TEX};
 use crate::gizmo::{self, RotateDrag, TranslateDrag};
 use crate::ik::{self, IkPullDrag};
@@ -38,6 +41,10 @@ pub struct AppState {
     pub clear_gpu_cache: bool,
     /// Bones that rotate when creating IK (tip's ancestors). Default 2 = arm/leg.
     pub ik_create_length: usize,
+    /// Open floating driver node editor for this driver id.
+    pub editing_driver: Option<u32>,
+    /// Drill-down page for driver spawn context menu (0 = root).
+    pub driver_spawn_page: u8,
 }
 
 #[derive(Clone, Copy)]
@@ -67,6 +74,8 @@ impl AppState {
             resync_camera: false,
             clear_gpu_cache: false,
             ik_create_length: 2,
+            editing_driver: None,
+            driver_spawn_page: 0,
         }
     }
 
@@ -98,6 +107,8 @@ impl AppState {
         self.edit_euler_deg = Vec3::ZERO;
         self.edit_translation = Vec3::ZERO;
         self.ik_create_length = 2;
+        self.editing_driver = None;
+        self.driver_spawn_page = 0;
         self.resync_camera = true;
         self.clear_gpu_cache = true;
     }
@@ -614,7 +625,7 @@ pub fn default_dock() -> DockState {
         DockNode::leaf(&["Viewport"]),
         DockNode::split_v(
             0.58,
-            DockNode::leaf(&["Bones", "Shapes", "Lights"]),
+            DockNode::leaf(&["Bones", "Shapes", "Drivers", "Lights"]),
             DockNode::leaf(&["Inspector"]),
         ),
     ))
@@ -646,7 +657,14 @@ impl Demo for RigApp {
     }
 
     fn update(state: &mut AppState, _dt: f32) -> bool {
-        state.has_drag()
+        if state.has_drag() {
+            return true;
+        }
+        // Keep ticking while soft / drivers need live evaluation in Pose.
+        state.rig.mode == AppMode::Pose
+            && (state.rig.soft_chains.iter().any(|c| c.enabled)
+                || state.rig.drivers.iter().any(|d| d.enabled)
+                || state.editing_driver.is_some())
     }
 
     fn build_ui(ui: &mut Ui, ctx: &mut UiCtx<'_>) -> bool {
@@ -774,6 +792,9 @@ impl Demo for RigApp {
             "Shapes" => {
                 shapes_panel(ui, state);
             }
+            "Drivers" => {
+                drivers_panel(ui, state);
+            }
             "Lights" => {
                 lights_panel(ui, state);
             }
@@ -783,6 +804,8 @@ impl Demo for RigApp {
             }
             _ => {}
         });
+
+        driver_editor_window(ui, state);
 
         ui.status_bar(|ui| {
             ui.label_styled(
@@ -794,7 +817,7 @@ impl Demo for RigApp {
             );
         });
 
-        keep || state.has_drag()
+        keep || state.has_drag() || state.editing_driver.is_some()
     }
 }
 
@@ -1142,9 +1165,20 @@ fn shapes_panel(ui: &mut Ui, state: &mut AppState) {
     ui.scroll_area("shapes_scroll", avail, ScrollAxes::Vertical, |ui| {
         for (i, name, mut w) in keys {
             let selected = active == Some(i);
+            let driven = state.rig.active_mesh.is_some_and(|mesh| {
+                state
+                    .rig
+                    .drivers
+                    .iter()
+                    .any(|d| d.drives_morph(mesh, i))
+            });
             if ui
                 .selectable(&format!("shape_{i}"), selected, |ui| {
-                    ui.label(&name);
+                    if driven {
+                        ui.label(&format!("{name} (driven)"));
+                    } else {
+                        ui.label(&name);
+                    }
                 })
                 .clicked()
             {
@@ -1168,6 +1202,708 @@ fn shapes_panel(ui: &mut Ui, state: &mut AppState) {
         state.rig.active_shape = Some(i);
         if state.rig.mode != AppMode::Shape {
             state.set_mode(AppMode::Shape);
+        }
+    }
+}
+
+fn drivers_panel(ui: &mut Ui, state: &mut AppState) {
+    ui.label_styled(
+        &format!("Drivers ({})", state.rig.drivers.len()),
+        TextStyle {
+            color: [0.9, 0.9, 0.9, 1.0],
+            size: 14.0,
+        },
+    );
+    ui.label("Named graphs · Edit opens floating node editor");
+    ui.label("Set on IK parent (e.g. clavicle) → pre-IK; morphs / rest → post-IK");
+    ui.separator();
+
+    if ui.button("+ Driver").clicked() {
+        let id = state.rig.create_driver();
+        state.editing_driver = Some(id);
+        if state.rig.mode != AppMode::Pose {
+            state.set_mode(AppMode::Pose);
+        }
+        state.status = format!("Created Driver {id} — edit graph in floating window");
+    }
+
+    if state.rig.mode != AppMode::Pose {
+        ui.horizontal(|ui| {
+            ui.label("Drivers run in Pose.");
+            if ui.button("Pose").clicked() {
+                state.set_mode(AppMode::Pose);
+            }
+        });
+    }
+
+    ui.separator();
+    if state.rig.drivers.is_empty() {
+        ui.label("No drivers yet. + Driver to create one.");
+        return;
+    }
+
+    let ids: Vec<u32> = state.rig.drivers.iter().map(|d| d.id).collect();
+    let mut remove: Option<u32> = None;
+    let mut open_edit: Option<u32> = None;
+    let avail = ui.available_size();
+
+    ui.scroll_area("drivers_scroll", avail, ScrollAxes::Vertical, |ui| {
+        for id in ids {
+            ui.separator();
+            let Some(idx) = state.rig.drivers.iter().position(|d| d.id == id) else {
+                continue;
+            };
+            let node_count = state.rig.drivers[idx].nodes.len();
+            let link_count = state.rig.drivers[idx].space.links.len();
+            let pre_ik = crate::driver::driver_needs_pre_ik(&state.rig, &state.rig.drivers[idx]);
+            let editing = state.editing_driver == Some(id);
+
+            ui.horizontal(|ui| {
+                let mut enabled = state.rig.drivers[idx].enabled;
+                if ui
+                    .checkbox(&format!("##drv_en_{id}"), &mut enabled)
+                    .changed()
+                {
+                    state.rig.drivers[idx].enabled = enabled;
+                }
+                ui.text_input(
+                    &format!("drv_name_{id}"),
+                    &mut state.rig.drivers[idx].name,
+                );
+            });
+            let pass = if pre_ik { "pre-IK" } else { "post-IK" };
+            ui.label(&format!("{node_count} nodes · {link_count} links · {pass}"));
+            ui.horizontal(|ui| {
+                let edit_label = if editing {
+                    format!("Editing…##drv_ed_{id}")
+                } else {
+                    format!("Edit##drv_ed_{id}")
+                };
+                if ui.button(&edit_label).clicked() {
+                    open_edit = Some(id);
+                }
+                if ui.button(&format!("Del##drv_del_{id}")).clicked() {
+                    remove = Some(id);
+                }
+            });
+        }
+    });
+
+    if let Some(id) = open_edit {
+        state.editing_driver = Some(id);
+        if state.rig.mode != AppMode::Pose {
+            state.set_mode(AppMode::Pose);
+        }
+        state.status = format!("Editing {}", state.rig.drivers.iter().find(|d| d.id == id).map(|d| d.name.as_str()).unwrap_or("driver"));
+    }
+    if let Some(id) = remove {
+        if state.editing_driver == Some(id) {
+            state.editing_driver = None;
+        }
+        state.rig.remove_driver(id);
+        state.status = format!("Removed driver #{id}");
+    }
+}
+
+fn driver_spawn_menu(ui: &mut Ui, page: &mut u8) -> Option<DriverNodeKind> {
+    let mut kind = None;
+    match *page {
+        1 => {
+            if ui.menu_item_keep_open("← Back").clicked() {
+                *page = 0;
+            }
+            ui.separator();
+            ui.menu_section("Constants");
+            if ui.menu_item("Float").clicked() {
+                kind = Some(DriverNodeKind::Float);
+            }
+            if ui.menu_item("Vec3").clicked() {
+                kind = Some(DriverNodeKind::Vec3);
+            }
+            if ui.menu_item("Quat Euler").clicked() {
+                kind = Some(DriverNodeKind::QuatEuler);
+            }
+        }
+        2 => {
+            if ui.menu_item_keep_open("← Back").clicked() {
+                *page = 0;
+            }
+            ui.separator();
+            ui.menu_section("Math");
+            if ui.menu_item("Remap 0–1").clicked() {
+                kind = Some(DriverNodeKind::Remap);
+            }
+            if ui.menu_item("Map Range").clicked() {
+                kind = Some(DriverNodeKind::MapRange);
+            }
+            if ui.menu_item("Clamp").clicked() {
+                kind = Some(DriverNodeKind::Clamp);
+            }
+            if ui.menu_item("Add").clicked() {
+                kind = Some(DriverNodeKind::Add);
+            }
+            if ui.menu_item("Mul").clicked() {
+                kind = Some(DriverNodeKind::Mul);
+            }
+        }
+        3 => {
+            if ui.menu_item_keep_open("← Back").clicked() {
+                *page = 0;
+            }
+            ui.separator();
+            ui.menu_section("Vector");
+            if ui.menu_item("Combine XYZ").clicked() {
+                kind = Some(DriverNodeKind::CombineVec3);
+            }
+            if ui.menu_item("Split XYZ").clicked() {
+                kind = Some(DriverNodeKind::SplitVec3);
+            }
+            if ui.menu_item("Vec3 Add").clicked() {
+                kind = Some(DriverNodeKind::Vec3Add);
+            }
+            if ui.menu_item("Vec3 Scale").clicked() {
+                kind = Some(DriverNodeKind::Vec3Scale);
+            }
+            if ui.menu_item("Length").clicked() {
+                kind = Some(DriverNodeKind::Vec3Length);
+            }
+            if ui.menu_item("Normalize").clicked() {
+                kind = Some(DriverNodeKind::Vec3Normalize);
+            }
+        }
+        4 => {
+            if ui.menu_item_keep_open("← Back").clicked() {
+                *page = 0;
+            }
+            ui.separator();
+            ui.menu_section("Quaternion");
+            if ui.menu_item("Quat Mul").clicked() {
+                kind = Some(DriverNodeKind::QuatMul);
+            }
+            if ui.menu_item("Quat × Vec").clicked() {
+                kind = Some(DriverNodeKind::QuatRotateVec);
+            }
+            if ui.menu_item("Quat Invert").clicked() {
+                kind = Some(DriverNodeKind::QuatInvert);
+            }
+            if ui.menu_item("Quat Scale").clicked() {
+                kind = Some(DriverNodeKind::QuatScale);
+            }
+            if ui.menu_item("Quat Angle °").clicked() {
+                kind = Some(DriverNodeKind::QuatAngle);
+            }
+            if ui.menu_item("Quat → Euler").clicked() {
+                kind = Some(DriverNodeKind::QuatToEuler);
+            }
+        }
+        _ => {
+            if ui.menu_item("Get Bone").clicked() {
+                kind = Some(DriverNodeKind::BoneGet);
+            }
+            if ui.menu_item("Set Bone").clicked() {
+                kind = Some(DriverNodeKind::BoneSet);
+            }
+            if ui.menu_item("Set Morph").clicked() {
+                kind = Some(DriverNodeKind::MorphSet);
+            }
+            ui.separator();
+            if ui.menu_item_submenu("Constants").clicked() {
+                *page = 1;
+            }
+            if ui.menu_item_submenu("Math").clicked() {
+                *page = 2;
+            }
+            if ui.menu_item_submenu("Vector").clicked() {
+                *page = 3;
+            }
+            if ui.menu_item_submenu("Quaternion").clicked() {
+                *page = 4;
+            }
+        }
+    }
+    kind
+}
+
+fn bone_select_index(bones: &[(BoneId, String)], bone: Option<BoneId>) -> usize {
+    match bone {
+        Some(b) => bones
+            .iter()
+            .position(|(id, _)| *id == b)
+            .map(|i| i + 1)
+            .unwrap_or(0),
+        None => 0,
+    }
+}
+
+fn bone_picker_row(
+    ui: &mut Ui,
+    node_id: &str,
+    bone: &mut Option<BoneId>,
+    space: &mut DriverSpace,
+    bone_list: &[(BoneId, String)],
+    bone_labels: &[String],
+    selection: Option<BoneId>,
+    status_msg: &mut Option<String>,
+) {
+    let bone_opts: Vec<&str> = bone_labels.iter().map(|s| s.as_str()).collect();
+    let space_opts = ["Local", "World", "Offset"];
+
+    ui.horizontal(|ui| {
+        let mut bi = bone_select_index(bone_list, *bone);
+        if ui
+            .select(&format!("bone_{node_id}"), &mut bi, &bone_opts)
+            .changed()
+        {
+            *bone = if bi == 0 {
+                None
+            } else {
+                bone_list.get(bi - 1).map(|(id, _)| *id)
+            };
+        }
+        if ui.icon_button(&format!("pick_{node_id}"), "edit", selection.is_some()) {
+            if let Some(sel) = selection {
+                *bone = Some(sel);
+                *status_msg = Some("Bone ← selection".into());
+            } else {
+                *status_msg = Some("Select a bone in the viewport first".into());
+            }
+        }
+    });
+    let mut si = space.index();
+    if ui
+        .select(&format!("space_{node_id}"), &mut si, &space_opts)
+        .changed()
+    {
+        *space = DriverSpace::ALL[si.min(2)];
+    }
+}
+
+fn driver_editor_window(ui: &mut Ui, state: &mut AppState) {
+    let Some(drv_id) = state.editing_driver else {
+        return;
+    };
+    if !state.rig.drivers.iter().any(|d| d.id == drv_id) {
+        state.editing_driver = None;
+        return;
+    }
+
+    let title = state
+        .rig
+        .drivers
+        .iter()
+        .find(|d| d.id == drv_id)
+        .map(|d| format!("Driver — {}", d.name))
+        .unwrap_or_else(|| "Driver".into());
+
+    let mut bone_list: Vec<(BoneId, String)> = state
+        .rig
+        .bones
+        .iter()
+        .map(|b| (b.id, b.name.clone()))
+        .collect();
+    bone_list.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+    let bone_labels: Vec<String> = std::iter::once("(none)".into())
+        .chain(bone_list.iter().map(|(_, n)| n.clone()))
+        .collect();
+    let selection = state.rig.selection;
+    let active_mesh = state.rig.active_mesh;
+    let active_shape = state.rig.active_shape;
+    let active_shape_name = match (active_mesh, active_shape) {
+        (Some(m), Some(i)) => state
+            .scene
+            .meshes
+            .get(m)
+            .and_then(|mesh| mesh.morph_targets.get(i))
+            .map(|t| t.name.clone()),
+        _ => None,
+    };
+    let ik_parent_bones: std::collections::HashSet<(u32, u32)> = state
+        .rig
+        .bones
+        .iter()
+        .filter(|b| crate::driver::bone_supports_ik(&state.rig, b.id))
+        .map(|b| b.id.node.key())
+        .collect();
+
+    let mut open = true;
+    let mut status_msg: Option<String> = None;
+    let mut spawn_page = state.driver_spawn_page;
+
+    ui.window(
+        Window::new(&title)
+            .open(&mut open)
+            .resizable(true)
+            .pos(Vec2::new(64.0, 48.0))
+            .size(Vec2::new(780.0, 520.0)),
+        |ui| {
+            let Some(driver) = state.rig.drivers.iter_mut().find(|d| d.id == drv_id) else {
+                return;
+            };
+            driver.apply_deletes();
+            driver.apply_clones();
+
+            ui.horizontal(|ui| {
+                ui.label("RMB empty → spawn");
+                let sel_n = driver.space.selected_nodes.len();
+                if ui.icon_button("drv_clone", "copy", sel_n > 0) {
+                    if sel_n > 0 {
+                        driver.space.request_clone_nodes = driver.space.selected_nodes.clone();
+                        status_msg = Some(format!("Clone {sel_n} node(s)"));
+                    }
+                }
+                if ui.icon_button("drv_del", "delete", sel_n > 0) {
+                    if sel_n > 0 {
+                        let ids = driver.space.selected_nodes.clone();
+                        for id in &ids {
+                            driver.space.detach_node(id);
+                        }
+                        driver.space.request_delete_nodes.extend(ids);
+                        status_msg = Some(format!("Delete {sel_n} node(s)"));
+                    }
+                }
+            });
+            ui.separator();
+
+            let size = ui.available_size();
+            let size = Vec2::new(size.x, (size.y - 4.0).max(160.0));
+
+            let mut spawn_at: Option<(DriverNodeKind, Vec2)> = None;
+            {
+                let space = &mut driver.space;
+                let nodes = &mut driver.nodes;
+
+                ui.node_space(&format!("drv_graph_{drv_id}"), size, space, |ui| {
+                    for n in nodes.iter_mut() {
+                        let id = n.id.clone();
+                        let title = n.title.clone();
+                        let kind = n.kind;
+                        let preview = n.preview.clone();
+                        ui.node(&id, &title, &mut n.pos, |ui| {
+                            draw_driver_node_body(
+                                ui,
+                                &id,
+                                kind,
+                                &mut n.bone,
+                                &mut n.space,
+                                &mut n.mesh,
+                                &mut n.shape,
+                                &mut n.floats,
+                                &bone_list,
+                                &bone_labels,
+                                selection,
+                                active_mesh,
+                                active_shape,
+                                active_shape_name.as_deref(),
+                                &preview,
+                                &mut status_msg,
+                                &ik_parent_bones,
+                            );
+                        });
+                    }
+                });
+
+                let bg = space.background_hovered;
+                let world = space.context_world.unwrap_or(Vec2::new(80.0, 80.0));
+                if space.context_menu_request {
+                    spawn_page = 0;
+                }
+                let mut spawn_kind: Option<DriverNodeKind> = None;
+                ui.context_menu(&format!("drv_spawn_{drv_id}"), bg, |ui| {
+                    spawn_kind = driver_spawn_menu(ui, &mut spawn_page);
+                });
+                if let Some(kind) = spawn_kind {
+                    spawn_at = Some((kind, world));
+                    spawn_page = 0;
+                }
+            }
+            if let Some((kind, world)) = spawn_at {
+                driver.spawn_node(kind, world);
+                status_msg = Some(format!("Spawned {}", kind.title()));
+            }
+        },
+    );
+
+    state.driver_spawn_page = spawn_page;
+
+    if !open {
+        state.editing_driver = None;
+        state.driver_spawn_page = 0;
+    }
+    if let Some(msg) = status_msg {
+        state.status = msg;
+    }
+}
+
+fn draw_driver_node_body(
+    ui: &mut Ui,
+    node_id: &str,
+    kind: DriverNodeKind,
+    bone: &mut Option<BoneId>,
+    space: &mut DriverSpace,
+    mesh: &mut Option<mega_render::Handle<mega_render::Mesh>>,
+    shape: &mut usize,
+    floats: &mut [f32; 4],
+    bone_list: &[(BoneId, String)],
+    bone_labels: &[String],
+    selection: Option<BoneId>,
+    active_mesh: Option<mega_render::Handle<mega_render::Mesh>>,
+    active_shape: Option<usize>,
+    active_shape_name: Option<&str>,
+    preview: &str,
+    status_msg: &mut Option<String>,
+    ik_parent_bones: &std::collections::HashSet<(u32, u32)>,
+) {
+    match kind {
+        DriverNodeKind::BoneGet => {
+            ui.node_port(NodePortSide::Output, "pos", port_type::VEC3);
+            ui.node_port(NodePortSide::Output, "rot", port_type::QUAT);
+            ui.node_port(NodePortSide::Output, "scale", port_type::VEC3);
+            bone_picker_row(
+                ui,
+                node_id,
+                bone,
+                space,
+                bone_list,
+                bone_labels,
+                selection,
+                status_msg,
+            );
+            if !preview.is_empty() {
+                ui.label(preview);
+            }
+        }
+        DriverNodeKind::BoneSet => {
+            ui.node_port(NodePortSide::Input, "pos", port_type::VEC3);
+            ui.node_port(NodePortSide::Input, "rot", port_type::QUAT);
+            ui.node_port(NodePortSide::Input, "scale", port_type::VEC3);
+            bone_picker_row(
+                ui,
+                node_id,
+                bone,
+                space,
+                bone_list,
+                bone_labels,
+                selection,
+                status_msg,
+            );
+            if bone.is_some_and(|b| ik_parent_bones.contains(&b.node.key())) {
+                ui.label("pre-IK (parent of IK chain)");
+            }
+            if !preview.is_empty() {
+                ui.label(preview);
+            }
+        }
+        DriverNodeKind::MorphSet => {
+            ui.node_port(NodePortSide::Input, "in", port_type::FLOAT);
+            let label = if mesh.is_some() {
+                format!("shape #{shape}")
+            } else {
+                "(no morph)".into()
+            };
+            ui.label(&label);
+            ui.horizontal(|ui| {
+                if ui.icon_button(&format!("morph_{node_id}"), "edit", active_shape.is_some()) {
+                    match (active_mesh, active_shape) {
+                        (Some(m), Some(s)) => {
+                            *mesh = Some(m);
+                            *shape = s;
+                            let name = active_shape_name.unwrap_or("shape");
+                            *status_msg = Some(format!("Morph ← {name}"));
+                        }
+                        _ => *status_msg = Some("Select an active shape key first".into()),
+                    }
+                }
+                ui.label("active shape");
+            });
+            if !preview.is_empty() {
+                ui.label(&format!("w={preview}"));
+            }
+        }
+        DriverNodeKind::Float => {
+            ui.node_port(NodePortSide::Output, "value", port_type::FLOAT);
+            ui.drag_float(&format!("c_{node_id}"), &mut floats[0], 0.1);
+        }
+        DriverNodeKind::Vec3 => {
+            ui.node_port(NodePortSide::Output, "v", port_type::VEC3);
+            let mut v = Vec3::new(floats[0], floats[1], floats[2]);
+            if ui
+                .vec3(&format!("v3_{node_id}"), &mut v, 0.1, Vec3::ZERO)
+                .changed()
+            {
+                floats[0] = v.x;
+                floats[1] = v.y;
+                floats[2] = v.z;
+            }
+        }
+        DriverNodeKind::QuatEuler => {
+            ui.node_port(NodePortSide::Output, "q", port_type::QUAT);
+            ui.label("X / Y / Z °");
+            let mut v = Vec3::new(floats[0], floats[1], floats[2]);
+            if ui
+                .vec3(&format!("qe_{node_id}"), &mut v, 1.0, Vec3::ZERO)
+                .changed()
+            {
+                floats[0] = v.x;
+                floats[1] = v.y;
+                floats[2] = v.z;
+            }
+        }
+        DriverNodeKind::QuatToEuler => {
+            ui.node_port(NodePortSide::Input, "q", port_type::QUAT);
+            ui.label("X / Y / Z °");
+            if !preview.is_empty() {
+                ui.label(preview);
+            }
+            ui.node_port(NodePortSide::Output, "euler", port_type::VEC3);
+            ui.node_port(NodePortSide::Output, "x", port_type::FLOAT);
+            ui.node_port(NodePortSide::Output, "y", port_type::FLOAT);
+            ui.node_port(NodePortSide::Output, "z", port_type::FLOAT);
+        }
+        DriverNodeKind::Remap => {
+            ui.node_port(NodePortSide::Input, "in", port_type::FLOAT);
+            ui.horizontal(|ui| {
+                ui.label("From");
+                ui.drag_float(&format!("from_{node_id}"), &mut floats[0], 0.5);
+            });
+            ui.horizontal(|ui| {
+                ui.label("To");
+                ui.drag_float(&format!("to_{node_id}"), &mut floats[1], 0.5);
+            });
+            if !preview.is_empty() {
+                ui.label(&format!("= {preview}"));
+            }
+            ui.node_port(NodePortSide::Output, "out", port_type::FLOAT);
+        }
+        DriverNodeKind::MapRange => {
+            ui.node_port(NodePortSide::Input, "in", port_type::FLOAT);
+            ui.label("In");
+            ui.horizontal(|ui| {
+                ui.drag_float(&format!("if_{node_id}"), &mut floats[0], 0.5);
+                ui.drag_float(&format!("it_{node_id}"), &mut floats[1], 0.5);
+            });
+            ui.label("Out");
+            ui.horizontal(|ui| {
+                ui.drag_float(&format!("of_{node_id}"), &mut floats[2], 0.5);
+                ui.drag_float(&format!("ot_{node_id}"), &mut floats[3], 0.5);
+            });
+            if !preview.is_empty() {
+                ui.label(&format!("= {preview}"));
+            }
+            ui.node_port(NodePortSide::Output, "out", port_type::FLOAT);
+        }
+        DriverNodeKind::Clamp => {
+            ui.node_port(NodePortSide::Input, "in", port_type::FLOAT);
+            ui.horizontal(|ui| {
+                ui.label("Min");
+                ui.drag_float(&format!("lo_{node_id}"), &mut floats[0], 0.05);
+            });
+            ui.horizontal(|ui| {
+                ui.label("Max");
+                ui.drag_float(&format!("hi_{node_id}"), &mut floats[1], 0.05);
+            });
+            if !preview.is_empty() {
+                ui.label(&format!("= {preview}"));
+            }
+            ui.node_port(NodePortSide::Output, "out", port_type::FLOAT);
+        }
+        DriverNodeKind::Add | DriverNodeKind::Mul => {
+            ui.node_port(NodePortSide::Input, "a", port_type::FLOAT);
+            ui.node_port(NodePortSide::Input, "b", port_type::FLOAT);
+            if !preview.is_empty() {
+                ui.label(&format!("= {preview}"));
+            }
+            ui.node_port(NodePortSide::Output, "out", port_type::FLOAT);
+        }
+        DriverNodeKind::CombineVec3 => {
+            ui.node_port(NodePortSide::Input, "x", port_type::FLOAT);
+            ui.node_port(NodePortSide::Input, "y", port_type::FLOAT);
+            ui.node_port(NodePortSide::Input, "z", port_type::FLOAT);
+            if !preview.is_empty() {
+                ui.label(preview);
+            }
+            ui.node_port(NodePortSide::Output, "out", port_type::VEC3);
+        }
+        DriverNodeKind::SplitVec3 => {
+            ui.node_port(NodePortSide::Input, "v", port_type::VEC3);
+            if !preview.is_empty() {
+                ui.label(preview);
+            }
+            ui.node_port(NodePortSide::Output, "x", port_type::FLOAT);
+            ui.node_port(NodePortSide::Output, "y", port_type::FLOAT);
+            ui.node_port(NodePortSide::Output, "z", port_type::FLOAT);
+        }
+        DriverNodeKind::Vec3Add => {
+            ui.node_port(NodePortSide::Input, "a", port_type::VEC3);
+            ui.node_port(NodePortSide::Input, "b", port_type::VEC3);
+            if !preview.is_empty() {
+                ui.label(preview);
+            }
+            ui.node_port(NodePortSide::Output, "out", port_type::VEC3);
+        }
+        DriverNodeKind::Vec3Scale => {
+            ui.node_port(NodePortSide::Input, "v", port_type::VEC3);
+            ui.node_port(NodePortSide::Input, "s", port_type::FLOAT);
+            if !preview.is_empty() {
+                ui.label(preview);
+            }
+            ui.node_port(NodePortSide::Output, "out", port_type::VEC3);
+        }
+        DriverNodeKind::Vec3Length => {
+            ui.node_port(NodePortSide::Input, "v", port_type::VEC3);
+            if !preview.is_empty() {
+                ui.label(preview);
+            }
+            ui.node_port(NodePortSide::Output, "out", port_type::FLOAT);
+        }
+        DriverNodeKind::Vec3Normalize => {
+            ui.node_port(NodePortSide::Input, "v", port_type::VEC3);
+            if !preview.is_empty() {
+                ui.label(preview);
+            }
+            ui.node_port(NodePortSide::Output, "out", port_type::VEC3);
+        }
+        DriverNodeKind::QuatMul => {
+            ui.node_port(NodePortSide::Input, "a", port_type::QUAT);
+            ui.node_port(NodePortSide::Input, "b", port_type::QUAT);
+            if !preview.is_empty() {
+                ui.label(preview);
+            }
+            ui.node_port(NodePortSide::Output, "out", port_type::QUAT);
+        }
+        DriverNodeKind::QuatRotateVec => {
+            ui.node_port(NodePortSide::Input, "q", port_type::QUAT);
+            ui.node_port(NodePortSide::Input, "v", port_type::VEC3);
+            if !preview.is_empty() {
+                ui.label(preview);
+            }
+            ui.node_port(NodePortSide::Output, "out", port_type::VEC3);
+        }
+        DriverNodeKind::QuatInvert => {
+            ui.node_port(NodePortSide::Input, "q", port_type::QUAT);
+            if !preview.is_empty() {
+                ui.label(preview);
+            }
+            ui.node_port(NodePortSide::Output, "out", port_type::QUAT);
+        }
+        DriverNodeKind::QuatScale => {
+            ui.node_port(NodePortSide::Input, "q", port_type::QUAT);
+            ui.node_port(NodePortSide::Input, "t", port_type::FLOAT);
+            ui.horizontal(|ui| {
+                ui.label("Weight");
+                ui.drag_float(&format!("qs_{node_id}"), &mut floats[0], 0.01);
+            });
+            if !preview.is_empty() {
+                ui.label(preview);
+            }
+            ui.node_port(NodePortSide::Output, "out", port_type::QUAT);
+        }
+        DriverNodeKind::QuatAngle => {
+            ui.node_port(NodePortSide::Input, "a", port_type::QUAT);
+            ui.node_port(NodePortSide::Input, "b", port_type::QUAT);
+            if !preview.is_empty() {
+                ui.label(&format!("{preview}°"));
+            }
+            ui.node_port(NodePortSide::Output, "out", port_type::FLOAT);
         }
     }
 }
