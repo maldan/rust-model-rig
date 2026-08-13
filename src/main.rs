@@ -1,4 +1,5 @@
 mod app;
+mod cpu_profile;
 mod driver;
 mod framework;
 mod gizmo;

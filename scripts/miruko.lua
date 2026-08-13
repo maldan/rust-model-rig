@@ -1,4 +1,6 @@
-rig.load_model("F:/csharp/VR_Waifu/asset/model/Miruko/Miruko.gltf")
+rig.load_model("F:/3d/h_project/New/Miruko/Miruko.glb")
+
+-- rig.load_model("F:/csharp/VR_Waifu/asset/model/Miruko/Miruko.gltf")
 print("loaded " .. #rig.list_bones() .. " bones")
 
 local function bone(name, side)
@@ -31,6 +33,13 @@ end
 
 for _, side in ipairs({ "L", "R" }) do
   rig.create_ik(bone("Hand", side), 2)
+  rig.create_soft(bone("Boob", side), {
+    gravity = 9.8,
+    stiffness = 55,
+    damping = 5,
+    inertia = 0.1,
+    max_angle = 60,
+  })
   clavicle_follow(side)
   scapula_slide(side)
 end

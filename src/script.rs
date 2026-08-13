@@ -359,13 +359,37 @@ fn register_rig(lua: &Lua) -> mlua::Result<()> {
 
     rig.set(
         "create_soft",
-        lua.create_function(|lua, bone: String| {
+        lua.create_function(|lua, (bone, opts): (String, Option<Table>)| {
             let state = app(lua)?;
             let id = require_bone(state, &bone)?;
-            state
+            let chain_id = state
                 .rig
                 .create_soft_from_bone(&state.scene, id)
-                .map_err(lua_err)
+                .map_err(lua_err)?;
+            if let Some(opts) = opts {
+                let chain = state
+                    .rig
+                    .soft_chains
+                    .iter_mut()
+                    .find(|c| c.id == chain_id)
+                    .ok_or_else(|| lua_err(format!("unknown soft chain {chain_id}")))?;
+                if let Some(v) = table_f32(&opts, "gravity")? {
+                    chain.gravity = v;
+                }
+                if let Some(v) = table_f32(&opts, "stiffness")? {
+                    chain.stiffness = v;
+                }
+                if let Some(v) = table_f32(&opts, "damping")? {
+                    chain.damping = v;
+                }
+                if let Some(v) = table_f32(&opts, "inertia")? {
+                    chain.inertia = v;
+                }
+                if let Some(v) = table_f32(&opts, "max_angle")? {
+                    chain.max_angle = v.to_radians();
+                }
+            }
+            Ok(chain_id)
         })?,
     )?;
 

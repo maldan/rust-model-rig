@@ -19,6 +19,7 @@ use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use crate::app::{handle_tools, AppState, PointerFrame};
+use crate::cpu_profile::{CpuProfile, Zone};
 use crate::driver::{evaluate_drivers, DriverPass};
 use crate::gizmo;
 use crate::ik_chain::{draw_ik_helpers, evaluate_ik_chains};
@@ -411,6 +412,7 @@ pub struct Host<D: Demo> {
     want_capture_mouse: bool,
     want_capture_keyboard: bool,
     viewport_size: Vec2,
+    cpu_profile: CpuProfile,
     _marker: std::marker::PhantomData<D>,
 }
 
@@ -449,6 +451,7 @@ impl<D: Demo> Host<D> {
             want_capture_mouse: false,
             want_capture_keyboard: false,
             viewport_size: Vec2::new(1280.0, 720.0),
+            cpu_profile: CpuProfile::new(),
             _marker: std::marker::PhantomData,
         }
     }
@@ -584,6 +587,29 @@ impl<D: Demo> Host<D> {
         window.set_cursor(map_cursor(cursor));
     }
 
+    fn dump_cpu_profile(&mut self) {
+        let extra = format!(
+            "mode={:?} tool={:?} bones={} ik={} soft={} drivers={} skel={} weights={}",
+            self.state.rig.mode,
+            self.state.rig.tool,
+            self.state.rig.bones.len(),
+            self.state.rig.ik_chains.len(),
+            self.state.rig.soft_chains.len(),
+            self.state.rig.drivers.len(),
+            self.state.rig.show_skeleton,
+            self.state.rig.show_weights,
+        );
+        match self.cpu_profile.dump(&extra) {
+            Ok((path, report)) => {
+                if let Some(cb) = self.clipboard.as_mut() {
+                    let _ = cb.set_text(report);
+                }
+                self.state.status = format!("CPU profile → {} (copied)", path.display());
+            }
+            Err(e) => self.state.status = format!("CPU profile dump failed: {e}"),
+        }
+    }
+
     fn redraw(&mut self) {
         let Some(window) = self.window.clone() else {
             return;
@@ -593,6 +619,7 @@ impl<D: Demo> Host<D> {
             return;
         }
 
+        let mut clock = CpuProfile::begin();
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32();
         self.last_frame = now;
@@ -654,6 +681,7 @@ impl<D: Demo> Host<D> {
             self.input.to_ui(viewport, dt)
         };
 
+        clock.lap(Zone::Update);
         self.ui.begin_frame(ui_input);
 
         let cursor = {
@@ -682,8 +710,10 @@ impl<D: Demo> Host<D> {
             };
             gpu.visualizer.set_debug_view(debug_view);
             self.viewport_size = viewport_size;
+            clock.lap(Zone::UiBuild);
 
             let out = self.ui.end_frame();
+            clock.lap(Zone::UiEnd);
             self.want_capture_mouse = out.want_capture_mouse;
             self.want_capture_keyboard = out.want_capture_keyboard;
             self.animating = demo_anim || self.orbit.active() || keep_ui || out.needs_repaint;
@@ -727,11 +757,14 @@ impl<D: Demo> Host<D> {
                     );
                 }
             }
+            clock.lap(Zone::Tools);
 
             // Drivers that write IK parents (clavicle…) first — from last frame's pose.
             evaluate_drivers(&mut self.state.scene, &mut self.state.rig, DriverPass::PreIk);
+            clock.lap(Zone::DriversPreIk);
             // Pose IK: solve after tools / pre-drivers so targets & parents are set.
             evaluate_ik_chains(&mut self.state.scene, &self.state.rig);
+            clock.lap(Zone::Ik);
             // Soft chains: after IK so they inherit body / limb motion.
             evaluate_soft_chains(
                 &mut self.state.scene,
@@ -739,8 +772,10 @@ impl<D: Demo> Host<D> {
                 dt,
                 self.state.soft_grab_drag.as_ref(),
             );
+            clock.lap(Zone::Soft);
             // Post-IK drivers: morphs, twist, non-ancestor bones.
             evaluate_drivers(&mut self.state.scene, &mut self.state.rig, DriverPass::PostIk);
+            clock.lap(Zone::DriversPostIk);
 
             // Debug / gizmo after tools so pose matches this frame.
             self.state.scene.debug.clear();
@@ -752,7 +787,9 @@ impl<D: Demo> Host<D> {
                 4,
                 [0.28, 0.28, 0.30, 0.28], // major — still muted
             );
+            clock.lap(Zone::DbgGrid);
             draw_rig_debug(&mut self.state.scene, &self.state.rig);
+            clock.lap(Zone::DbgSkeleton);
             draw_ik_helpers(&mut self.state.scene, &self.state.rig);
             draw_soft_helpers(&mut self.state.scene, &self.state.rig);
             if let Some(ref grab) = self.state.soft_grab_drag {
@@ -777,6 +814,7 @@ impl<D: Demo> Host<D> {
                     );
                 }
             }
+            clock.lap(Zone::DbgHelpers);
             if self.state.rig.mode != AppMode::Shape {
                 if let (Some(sel), Some(pivot)) = (
                     self.state.rig.selection,
@@ -810,6 +848,7 @@ impl<D: Demo> Host<D> {
                     }
                 }
             }
+            clock.lap(Zone::DbgGizmo);
 
             // Orientation gizmo (HUD overlay on the viewport texture).
             {
@@ -855,6 +894,7 @@ impl<D: Demo> Host<D> {
                 }
                 let _ = self.state.scene.hud.end();
             }
+            clock.lap(Zone::Hud);
 
             if let Some(text) = out.clipboard {
                 if let Some(cb) = self.clipboard.as_mut() {
@@ -869,14 +909,18 @@ impl<D: Demo> Host<D> {
             gpu.scene_target
                 .resize(&gpu.device, &mut gpu.ui_renderer, vp_w, vp_h);
             gpu.visualizer.ensure_target(vp_w, vp_h);
+            clock.lap(Zone::VpResize);
 
             gpu.visualizer.sync(&self.state.scene);
+            clock.lap(Zone::GpuSync);
             let aspect = vp_w as f32 / vp_h as f32;
             gpu.visualizer
                 .render_to(&self.state.scene, aspect, &gpu.scene_target.render_view);
+            clock.lap(Zone::GpuScene);
 
             gpu.ui_renderer
                 .sync_atlases(&gpu.device, &gpu.queue, &mut self.ui);
+            clock.lap(Zone::GpuAtlas);
 
             let frame = match gpu.surface.get_current_texture() {
                 wgpu::CurrentSurfaceTexture::Success(t)
@@ -892,6 +936,7 @@ impl<D: Demo> Host<D> {
                 }
             };
 
+            clock.lap(Zone::Swapchain);
             let view = frame.texture.create_view(&Default::default());
             let mut encoder = gpu
                 .device
@@ -923,12 +968,15 @@ impl<D: Demo> Host<D> {
                 self.draw_stats = gpu.ui_renderer.draw(&gpu.queue, &mut pass, &draw_list);
             }
 
+            clock.lap(Zone::UiEncode);
             gpu.queue.submit(Some(encoder.finish()));
             window.pre_present_notify();
             gpu.queue.present(frame);
+            clock.lap(Zone::Present);
             cursor
         };
 
+        clock.finish(&mut self.cpu_profile);
         self.input.clear_edges();
         self.apply_cursor(&window, cursor);
     }
@@ -1087,6 +1135,13 @@ impl<D: Demo> ApplicationHandler for Host<D> {
             WindowEvent::KeyboardInput { event, .. } => {
                 let down = event.state == ElementState::Pressed;
                 if let PhysicalKey::Code(code) = event.physical_key {
+                    if down && code == KeyCode::F7 {
+                        self.cpu_profile.clear();
+                        self.state.status = "CPU profile buffer cleared. Reproduce hitch, then F8.".into();
+                    }
+                    if down && code == KeyCode::F8 {
+                        self.dump_cpu_profile();
+                    }
                     if down && code == KeyCode::Escape {
                         if !self.state.rig.selected.is_empty() || self.state.has_drag() {
                             self.state.rig.clear_selection();

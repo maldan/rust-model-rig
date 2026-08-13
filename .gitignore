@@ -2,3 +2,4 @@
 /Cargo.lock
 *.pdb
 .idea/
+cpu-profile.txt
