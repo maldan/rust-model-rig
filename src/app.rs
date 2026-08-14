@@ -41,6 +41,8 @@ pub struct AppState {
     pub clear_gpu_cache: bool,
     /// Bones that rotate when creating IK (tip's ancestors). Default 2 = arm/leg.
     pub ik_create_length: usize,
+    /// Selected chain in the IK tab.
+    pub selected_ik: Option<u32>,
     /// Open floating driver node editor for this driver id.
     pub editing_driver: Option<u32>,
     /// Drill-down page for driver spawn context menu (0 = root).
@@ -74,6 +76,7 @@ impl AppState {
             resync_camera: false,
             clear_gpu_cache: false,
             ik_create_length: 2,
+            selected_ik: None,
             editing_driver: None,
             driver_spawn_page: 0,
         }
@@ -107,6 +110,7 @@ impl AppState {
         self.edit_euler_deg = Vec3::ZERO;
         self.edit_translation = Vec3::ZERO;
         self.ik_create_length = 2;
+        self.selected_ik = None;
         self.editing_driver = None;
         self.driver_spawn_page = 0;
         self.resync_camera = true;
@@ -639,7 +643,7 @@ pub fn default_dock() -> DockState {
         DockNode::leaf(&["Viewport"]),
         DockNode::split_v(
             0.58,
-            DockNode::leaf(&["Bones", "Shapes", "Drivers", "Lights"]),
+            DockNode::leaf(&["Bones", "IK", "Shapes", "Drivers", "Lights"]),
             DockNode::leaf(&["Inspector"]),
         ),
     ))
@@ -805,6 +809,9 @@ impl Demo for RigApp {
             }
             "Bones" => {
                 bone_panel(ui, state);
+            }
+            "IK" => {
+                ik_panel(ui, state);
             }
             "Shapes" => {
                 shapes_panel(ui, state);
@@ -1006,8 +1013,10 @@ fn lights_panel(ui: &mut Ui, state: &mut AppState) {
             match light {
                 Light::Directional(d) => {
                     ui.label(&format!("Directional #{i}"));
-                    let _ = ui.checkbox(&format!("Enabled##dir_en_{i}"), &mut d.enabled);
-                    let _ = ui.checkbox(&format!("Shadows##dir_sh_{i}"), &mut d.cast_shadows);
+                    ui.id_scope(&format!("dir_{i}"), |ui| {
+                        let _ = ui.checkbox("Enabled", &mut d.enabled);
+                        let _ = ui.checkbox("Shadows", &mut d.cast_shadows);
+                    });
                     ui.label("Direction X / Y / Z");
                     let _ = ui.slider(&format!("dir_x_{i}"), &mut d.direction.x, -1.0..=1.0);
                     let _ = ui.slider(&format!("dir_y_{i}"), &mut d.direction.y, -1.0..=1.0);
@@ -1026,7 +1035,9 @@ fn lights_panel(ui: &mut Ui, state: &mut AppState) {
                 }
                 Light::Point(p) => {
                     ui.label(&format!("Point #{i}"));
-                    let _ = ui.checkbox(&format!("Enabled##pt_en_{i}"), &mut p.enabled);
+                    ui.id_scope(&format!("pt_{i}"), |ui| {
+                        let _ = ui.checkbox("Enabled", &mut p.enabled);
+                    });
                     ui.label("Position X / Y / Z");
                     let _ = ui.slider(&format!("pt_x_{i}"), &mut p.position.x, -10.0..=10.0);
                     let _ = ui.slider(&format!("pt_y_{i}"), &mut p.position.y, -10.0..=10.0);
@@ -1275,33 +1286,25 @@ fn drivers_panel(ui: &mut Ui, state: &mut AppState) {
             let pre_ik = crate::driver::driver_needs_pre_ik(&state.rig, &state.rig.drivers[idx]);
             let editing = state.editing_driver == Some(id);
 
-            ui.horizontal(|ui| {
-                let mut enabled = state.rig.drivers[idx].enabled;
-                if ui
-                    .checkbox(&format!("##drv_en_{id}"), &mut enabled)
-                    .changed()
-                {
-                    state.rig.drivers[idx].enabled = enabled;
-                }
-                ui.text_input(
-                    &format!("drv_name_{id}"),
-                    &mut state.rig.drivers[idx].name,
-                );
-            });
-            let pass = if pre_ik { "pre-IK" } else { "post-IK" };
-            ui.label(&format!("{node_count} nodes · {link_count} links · {pass}"));
-            ui.horizontal(|ui| {
-                let edit_label = if editing {
-                    format!("Editing…##drv_ed_{id}")
-                } else {
-                    format!("Edit##drv_ed_{id}")
-                };
-                if ui.button(&edit_label).clicked() {
-                    open_edit = Some(id);
-                }
-                if ui.button(&format!("Del##drv_del_{id}")).clicked() {
-                    remove = Some(id);
-                }
+            ui.id_scope(&format!("drv_{id}"), |ui| {
+                ui.horizontal(|ui| {
+                    let mut enabled = state.rig.drivers[idx].enabled;
+                    if ui.checkbox("", &mut enabled).changed() {
+                        state.rig.drivers[idx].enabled = enabled;
+                    }
+                    ui.text_input("name", &mut state.rig.drivers[idx].name);
+                });
+                let pass = if pre_ik { "pre-IK" } else { "post-IK" };
+                ui.label(&format!("{node_count} nodes · {link_count} links · {pass}"));
+                ui.horizontal(|ui| {
+                    let edit_label = if editing { "Editing…" } else { "Edit" };
+                    if ui.button(edit_label).clicked() {
+                        open_edit = Some(id);
+                    }
+                    if ui.button("Del").clicked() {
+                        remove = Some(id);
+                    }
+                });
             });
         }
     });
@@ -1965,8 +1968,6 @@ fn bone_panel(ui: &mut Ui, state: &mut AppState) {
     }
 
     ui.separator();
-    ik_chains_section(ui, state);
-    ui.separator();
     soft_chains_section(ui, state);
     ui.separator();
 
@@ -2010,58 +2011,170 @@ fn bone_panel(ui: &mut Ui, state: &mut AppState) {
     }
 }
 
-fn ik_chains_section(ui: &mut Ui, state: &mut AppState) {
+fn wrap_pole_angle(deg: f32) -> f32 {
+    let a = deg.rem_euclid(360.0);
+    if a > 180.0 {
+        a - 360.0
+    } else {
+        a
+    }
+}
+
+fn try_create_ik(state: &mut AppState, tip: BoneId) {
+    let len = state.ik_create_length;
+    match state.rig.create_ik_from_tip(&mut state.scene, tip, len) {
+        Ok(id) => {
+            state.selected_ik = Some(id);
+            state.edit_bone = None;
+            state.rig.tool = Tool::Translate;
+            if state.rig.mode != AppMode::Pose {
+                state.set_mode(AppMode::Pose);
+            }
+            state.status = format!(
+                "IK ×{len} · Target = foot/hand, Pole = knee/elbow aim, Pole Angle = twist"
+            );
+        }
+        Err(e) => {
+            state.status = e.into();
+        }
+    }
+}
+
+fn ik_panel(ui: &mut Ui, state: &mut AppState) {
     ui.label_styled(
-        &format!("IK Chains ({})", state.rig.ik_chains.len()),
+        &format!("IK ({})", state.rig.ik_chains.len()),
         TextStyle {
             color: [0.9, 0.9, 0.9, 1.0],
-            size: 13.0,
+            size: 14.0,
         },
     );
+    ui.label("Select tip (hand/foot) → Create. Pole aims the knee/elbow.");
+    ui.separator();
 
+    ui.label("Chain length (rotating bones)");
+    ui.horizontal(|ui| {
+        if ui.button("−").clicked() {
+            state.ik_create_length = state.ik_create_length.saturating_sub(1).max(1);
+        }
+        ui.label(&format!("{}", state.ik_create_length));
+        if ui.button("+").clicked() {
+            state.ik_create_length = (state.ik_create_length + 1).min(32);
+        }
+        if ui.button("Create IK").clicked() {
+            match state.rig.selection {
+                Some(sel) if state.rig.ik_control_kind(sel).is_none() => {
+                    try_create_ik(state, sel);
+                }
+                Some(_) => state.status = "Cannot create IK on a control bone".into(),
+                None => state.status = "Select a tip bone first".into(),
+            }
+        }
+    });
+
+    if state.rig.mode != AppMode::Pose {
+        ui.horizontal(|ui| {
+            ui.label("IK solves in Pose.");
+            if ui.button("Pose").clicked() {
+                state.set_mode(AppMode::Pose);
+            }
+        });
+    }
+
+    ui.separator();
     if state.rig.ik_chains.is_empty() {
-        ui.label("Select tip (hand/foot) → Create IK");
+        ui.label("No IK chains yet.");
         return;
     }
 
-    let chains: Vec<(u32, String, bool)> = state
-        .rig
-        .ik_chains
-        .iter()
-        .map(|c| (c.id, c.name.clone(), c.enabled))
-        .collect();
+    let ids: Vec<u32> = state.rig.ik_chains.iter().map(|c| c.id).collect();
+    let mut remove: Option<u32> = None;
+    let mut sel_target: Option<BoneId> = None;
+    let mut sel_pole: Option<BoneId> = None;
+    let mut flip: Option<u32> = None;
+    let avail = ui.available_size();
 
-    for (id, name, enabled) in chains {
-        ui.horizontal(|ui| {
-            let label = if enabled {
-                format!("● {name}")
-            } else {
-                format!("○ {name}")
+    ui.scroll_area("ik_scroll", avail, ScrollAxes::Vertical, |ui| {
+        for id in ids {
+            ui.separator();
+            let Some(idx) = state.rig.ik_chains.iter().position(|c| c.id == id) else {
+                continue;
             };
-            if ui.button(&label).clicked() {
-                state.rig.set_ik_enabled(id, !enabled);
-                state.status = if !enabled {
-                    format!("{name} enabled")
-                } else {
-                    format!("{name} muted")
-                };
-            }
-            if ui.button("Sel").clicked() {
-                if let Some(c) = state.rig.ik_chains.iter().find(|c| c.id == id) {
-                    let t = c.target;
-                    state.rig.set_selection(t);
-                    state.edit_bone = None;
-                    state.rig.tool = Tool::Translate;
-                    state.status_from_selection();
+            let selected = state.selected_ik == Some(id);
+            let n_bones = state.rig.ik_chains[idx].bones.len();
+            let tip_name = state
+                .rig
+                .bone(state.rig.ik_chains[idx].tip)
+                .map(|b| b.name.clone())
+                .unwrap_or_else(|| "?".into());
+
+            ui.id_scope(&format!("ik_{id}"), |ui| {
+                ui.horizontal(|ui| {
+                    let mut enabled = state.rig.ik_chains[idx].enabled;
+                    if ui.checkbox("", &mut enabled).changed() {
+                        state.rig.ik_chains[idx].enabled = enabled;
+                    }
+                    ui.text_input("name", &mut state.rig.ik_chains[idx].name);
+                });
+
+                if ui
+                    .selectable("row", selected, |ui| {
+                        ui.label(&format!("{n_bones} bones · tip {tip_name}"));
+                    })
+                    .clicked()
+                {
+                    state.selected_ik = Some(id);
                 }
-            }
-            if ui.button("X").clicked() {
-                state.rig.remove_ik_chain(&mut state.scene, id);
-                state.clear_drags();
-                state.edit_bone = None;
-                state.status = format!("Removed {name}");
-            }
-        });
+
+                ui.label("Pole angle (°)");
+                let _ = ui.slider("pole_angle", &mut state.rig.ik_chains[idx].pole_angle, -180.0..=180.0);
+
+                ui.horizontal(|ui| {
+                    if ui.button("Target").clicked() {
+                        sel_target = Some(state.rig.ik_chains[idx].target);
+                        state.selected_ik = Some(id);
+                    }
+                    if ui.button("Pole").clicked() {
+                        sel_pole = Some(state.rig.ik_chains[idx].pole);
+                        state.selected_ik = Some(id);
+                    }
+                    if ui.button("Flip").clicked() {
+                        flip = Some(id);
+                    }
+                    if ui.button("Del").clicked() {
+                        remove = Some(id);
+                    }
+                });
+            });
+        }
+    });
+
+    if let Some(id) = flip {
+        if let Some(c) = state.rig.ik_chains.iter_mut().find(|c| c.id == id) {
+            c.pole_angle = wrap_pole_angle(c.pole_angle + 180.0);
+        }
+        state.status = "Pole flipped 180°".into();
+    }
+    if let Some(bone) = sel_target.or(sel_pole) {
+        state.rig.set_selection(bone);
+        state.edit_bone = None;
+        state.rig.tool = Tool::Translate;
+        state.status_from_selection();
+    }
+    if let Some(id) = remove {
+        if state.selected_ik == Some(id) {
+            state.selected_ik = None;
+        }
+        let name = state
+            .rig
+            .ik_chains
+            .iter()
+            .find(|c| c.id == id)
+            .map(|c| c.name.clone())
+            .unwrap_or_default();
+        state.rig.remove_ik_chain(&mut state.scene, id);
+        state.clear_drags();
+        state.edit_bone = None;
+        state.status = format!("Removed {name}");
     }
 }
 
@@ -2197,19 +2310,41 @@ fn inspector_panel_body(ui: &mut Ui, state: &mut AppState) {
 
     // IK setup / manage
     {
-        let existing = state.rig.ik_chain_for_tip(sel).map(|c| c.id);
+        let existing = state.rig.ik_chain_touching(sel).map(|c| c.id);
         let is_control = state.rig.ik_control_kind(sel).is_some();
         if let Some(cid) = existing {
-            ui.label("IK on this tip");
+            ui.label("IK chain");
             if ui.button("Select IK target").clicked() {
                 if let Some(c) = state.rig.ik_chains.iter().find(|c| c.id == cid) {
                     let t = c.target;
                     state.rig.set_selection(t);
                     state.edit_bone = None;
                     state.rig.tool = Tool::Translate;
+                    state.selected_ik = Some(cid);
+                }
+            }
+            if ui.button("Select IK pole").clicked() {
+                if let Some(c) = state.rig.ik_chains.iter().find(|c| c.id == cid) {
+                    let p = c.pole;
+                    state.rig.set_selection(p);
+                    state.edit_bone = None;
+                    state.rig.tool = Tool::Translate;
+                    state.selected_ik = Some(cid);
+                }
+            }
+            if let Some(c) = state.rig.ik_chains.iter_mut().find(|c| c.id == cid) {
+                ui.label("Pole angle (°)");
+                let _ = ui.slider(&format!("insp_pa_{cid}"), &mut c.pole_angle, -180.0..=180.0);
+            }
+            if ui.button("Flip pole").clicked() {
+                if let Some(c) = state.rig.ik_chains.iter_mut().find(|c| c.id == cid) {
+                    c.pole_angle = wrap_pole_angle(c.pole_angle + 180.0);
                 }
             }
             if ui.button("Remove IK").clicked() {
+                if state.selected_ik == Some(cid) {
+                    state.selected_ik = None;
+                }
                 state.rig.remove_ik_chain(&mut state.scene, cid);
                 state.clear_drags();
                 state.edit_bone = None;
@@ -2228,22 +2363,7 @@ fn inspector_panel_body(ui: &mut Ui, state: &mut AppState) {
                 }
             });
             if ui.button("Create IK").clicked() {
-                let len = state.ik_create_length;
-                match state.rig.create_ik_from_tip(&mut state.scene, sel, len) {
-                    Ok(_) => {
-                        state.edit_bone = None;
-                        state.rig.tool = Tool::Translate;
-                        if state.rig.mode != AppMode::Pose {
-                            state.set_mode(AppMode::Pose);
-                        }
-                        state.status = format!(
-                            "IK ×{len} · Move target, Rotate target = hand, Pole = elbow"
-                        );
-                    }
-                    Err(e) => {
-                        state.status = e.into();
-                    }
-                }
+                try_create_ik(state, sel);
             }
             ui.separator();
         }
@@ -2312,7 +2432,7 @@ fn inspector_panel_body(ui: &mut Ui, state: &mut AppState) {
             if let Some(cid) = col_id {
                 ui.label("Capsule collider");
                 if let Some(c) = state.rig.colliders.iter_mut().find(|c| c.id == cid) {
-                    let _ = ui.checkbox(&format!("Enabled##col_en_{cid}"), &mut c.enabled);
+                    let _ = ui.checkbox("Enabled", &mut c.enabled);
                     ui.label("Radius");
                     if ui
                         .drag_float(&format!("col_r_{cid}"), &mut c.radius, 0.001)

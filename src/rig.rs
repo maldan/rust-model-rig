@@ -126,9 +126,13 @@ pub struct IkChain {
     pub bones: Vec<BoneId>,
     /// Control bone (`deform: false`) — drag this in Pose.
     pub target: BoneId,
-    /// Control bone — bend / pole preference.
+    /// Control bone — knee/elbow aim (bend plane).
     pub pole: BoneId,
     pub enabled: bool,
+    /// Twist of the bend plane around hip→foot, degrees (−180…180).
+    pub pole_angle: f32,
+    /// Rest "knee front" in root-bone local space (so pole still rolls a straight leg).
+    pub pole_ref_local: Vec3,
     /// Segment lengths bones[i]→bones[i+1], last → tip (for 2-bone analytic).
     pub lengths: Vec<f32>,
     /// `tip_world_rot = target_world_rot * tip_rot_offset` (set at Create IK).
@@ -663,8 +667,10 @@ impl RigDocument {
         None
     }
 
-    pub fn ik_chain_for_tip(&self, tip: BoneId) -> Option<&IkChain> {
-        self.ik_chains.iter().find(|c| c.tip == tip)
+    pub fn ik_chain_touching(&self, id: BoneId) -> Option<&IkChain> {
+        self.ik_chains.iter().find(|c| {
+            c.tip == id || c.target == id || c.pole == id || c.bones.iter().any(|b| *b == id)
+        })
     }
 
     /// Create IK from tip. `rotate_count` = how many ancestors of tip rotate (1..=32).
@@ -732,7 +738,14 @@ impl RigDocument {
             }
             bend = s;
         }
-        let pole_pos = mid_pos + bend.normalize() * avg * 1.15;
+        let bend_n = bend.normalize();
+        let pole_pos = mid_pos + bend_n * avg * 1.15;
+        let thigh_rot = {
+            let m = scene.world_matrix(bones[0].node);
+            let (_, r, _) = m.to_scale_rotation_translation();
+            r.normalize()
+        };
+        let pole_ref_local = thigh_rot.inverse() * bend_n;
 
         let tip_name = self
             .bone(tip)
@@ -762,6 +775,8 @@ impl RigDocument {
             target,
             pole,
             enabled: true,
+            pole_angle: 0.0,
+            pole_ref_local,
             lengths,
             // Matched at create → identity offset.
             tip_rot_offset: glam::Quat::IDENTITY,
@@ -779,12 +794,6 @@ impl RigDocument {
         let chain = self.ik_chains.remove(idx);
         self.delete_single_bone(scene, chain.target);
         self.delete_single_bone(scene, chain.pole);
-    }
-
-    pub fn set_ik_enabled(&mut self, chain_id: u32, enabled: bool) {
-        if let Some(c) = self.ik_chains.iter_mut().find(|c| c.id == chain_id) {
-            c.enabled = enabled;
-        }
     }
 
     pub fn soft_chain_containing(&self, id: BoneId) -> Option<&SoftChain> {
@@ -1307,14 +1316,28 @@ impl RigDocument {
     /// Rotating a bone swings *its* diamonds; old parent→self drawing looked
     /// like "only children move" because that segment's endpoints stay fixed.
     pub fn bone_segments(&self, scene: &Scene) -> Vec<(Vec3, Vec3, BoneId)> {
+        let wm = scene.world_matrices();
+        self.bone_segments_cached(&wm)
+    }
+
+    /// Same as `bone_segments` but takes a pre-built world-matrix cache
+    /// (see `Scene::world_matrices`) to avoid re-walking the node hierarchy
+    /// for every bone — important when called once per frame over all bones.
+    fn bone_segments_cached(
+        &self,
+        wm: &HashMap<(u32, u32), glam::Mat4>,
+    ) -> Vec<(Vec3, Vec3, BoneId)> {
+        let world = |node: Handle<Node>| -> glam::Mat4 {
+            wm.get(&node.key()).copied().unwrap_or(glam::Mat4::IDENTITY)
+        };
         let mut out = Vec::new();
         let fallback_len = {
             let mut sum = 0.0f32;
             let mut n = 0u32;
             for b in &self.bones {
                 if let Some(p) = b.parent {
-                    let a = scene.world_matrix(p.node).transform_point3(Vec3::ZERO);
-                    let c = scene.world_matrix(b.id.node).transform_point3(Vec3::ZERO);
+                    let a = world(p.node).transform_point3(Vec3::ZERO);
+                    let c = world(b.id.node).transform_point3(Vec3::ZERO);
                     let d = (c - a).length();
                     if d > 1e-5 {
                         sum += d;
@@ -1334,9 +1357,9 @@ impl RigDocument {
             if self.ik_control_kind(b.id).is_some() {
                 continue;
             }
-            let from = scene.world_matrix(b.id.node).transform_point3(Vec3::ZERO);
+            let from = world(b.id.node).transform_point3(Vec3::ZERO);
             if b.children.is_empty() {
-                let m = scene.world_matrix(b.id.node);
+                let m = world(b.id.node);
                 let axis = m.transform_vector3(Vec3::Y).normalize_or_zero();
                 if axis.length_squared() > 1e-8 {
                     out.push((from, from + axis * fallback_len * 0.65, b.id));
@@ -1346,7 +1369,7 @@ impl RigDocument {
                     if self.ik_control_kind(child).is_some() {
                         continue;
                     }
-                    let to = scene.world_matrix(child.node).transform_point3(Vec3::ZERO);
+                    let to = world(child.node).transform_point3(Vec3::ZERO);
                     if (to - from).length_squared() > 1e-10 {
                         out.push((from, to, b.id));
                     }
@@ -1682,7 +1705,11 @@ pub fn draw_rig_debug(scene: &mut Scene, rig: &RigDocument) {
     if !rig.show_skeleton {
         return;
     }
-    let segments = rig.bone_segments(scene);
+    // Build the world-matrix cache once per frame; `world_matrix()` walks the
+    // full ancestor chain on every call, which is O(bones * depth) if done
+    // per-bone and was the dominant cost of skeleton drawing.
+    let wm = scene.world_matrices();
+    let segments = rig.bone_segments_cached(&wm);
 
     // Outlines first (drawn under fills in submission order).
     for (from, to, id) in &segments {
@@ -1712,7 +1739,11 @@ pub fn draw_rig_debug(scene: &mut Scene, rig: &RigDocument) {
 
     // Joint dots at bone origins (points render after lines → sit on top).
     for b in &rig.bones {
-        let pos = scene.world_matrix(b.id.node).transform_point3(Vec3::ZERO);
+        let pos = wm
+            .get(&b.id.node.key())
+            .copied()
+            .unwrap_or(glam::Mat4::IDENTITY)
+            .transform_point3(Vec3::ZERO);
         let selected = rig.is_selected(b.id);
         let (outline, fill, joint, joint_out) = match (rig.ik_control_kind(b.id), selected) {
             (Some(IkControlKind::Target), false) => {

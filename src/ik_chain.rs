@@ -35,9 +35,9 @@ fn solve_chain(scene: &mut Scene, rig: &RigDocument, chain: &IkChain) {
     restore_chain_bind(scene, rig, chain);
 
     if chain.bones.len() == 2 && chain.lengths.len() >= 2 {
-        solve_two_bone(scene, chain, tip, target_pos, pole);
+        solve_two_bone(scene, chain, tip, target_pos, pole, chain.pole_angle);
     } else {
-        solve_ccd(scene, chain, tip, target_pos, pole);
+        solve_ccd(scene, chain, tip, target_pos, pole, chain.pole_angle);
     }
 
     apply_tip_rotation(scene, chain);
@@ -66,20 +66,28 @@ fn solve_two_bone(
     tip: BoneId,
     target: Vec3,
     pole: Vec3,
+    pole_angle: f32,
 ) {
     let root = chain.bones[0];
     let mid = chain.bones[1];
     let root_pos = scene.world_matrix(root.node).transform_point3(Vec3::ZERO);
     let len1 = chain.lengths[0].max(1e-4);
     let len2 = chain.lengths[1].max(1e-4);
-    let (mid_pos, tip_pos) = two_bone_positions(root_pos, len1, len2, target, pole);
-
-    // Swing from bind directions — keeps rest twist (no forced +Y basis).
+    let (mid_pos, tip_pos) = two_bone_positions(root_pos, len1, len2, target, pole, pole_angle);
     swing_bone_to(scene, root, mid, mid_pos);
+    // Roll around the thigh even when the leg is straight (knee offset ~ 0).
+    apply_pole_roll(scene, root, mid, chain.pole_ref_local, pole, pole_angle);
     swing_bone_to(scene, mid, tip, tip_pos);
 }
 
-fn solve_ccd(scene: &mut Scene, chain: &IkChain, tip: BoneId, target: Vec3, pole: Vec3) {
+fn solve_ccd(
+    scene: &mut Scene,
+    chain: &IkChain,
+    tip: BoneId,
+    target: Vec3,
+    pole: Vec3,
+    pole_angle: f32,
+) {
     for _ in 0..CCD_ITERS {
         for i in (0..chain.bones.len()).rev() {
             ccd_rotate_joint(scene, chain.bones[i], tip, target, 1.0);
@@ -87,13 +95,13 @@ fn solve_ccd(scene: &mut Scene, chain: &IkChain, tip: BoneId, target: Vec3, pole
     }
     // Single stable pole pass: twist around reach axis (no mid-CCD fight).
     let mid = chain.bones[chain.bones.len() / 2];
-    align_chain_to_pole(scene, chain.bones[0], mid, tip, target, pole);
+    align_chain_to_pole(scene, chain.bones[0], mid, tip, target, pole, pole_angle, chain.pole_ref_local);
     for _ in 0..(CCD_ITERS / 2) {
         for i in (0..chain.bones.len()).rev() {
             ccd_rotate_joint(scene, chain.bones[i], tip, target, 1.0);
         }
     }
-    align_chain_to_pole(scene, chain.bones[0], mid, tip, target, pole);
+    align_chain_to_pole(scene, chain.bones[0], mid, tip, target, pole, pole_angle, chain.pole_ref_local);
 }
 
 /// Tip world rotation = target world rotation * offset (offset captured at Create IK).
@@ -145,6 +153,48 @@ fn apply_world_delta_rot(scene: &mut Scene, bone: BoneId, world_delta: Quat) {
     node.local.rotation = (parent_rot.inverse() * (world_delta * world_r).normalize()).normalize();
 }
 
+fn apply_pole_roll(
+    scene: &mut Scene,
+    bone: BoneId,
+    child: BoneId,
+    ref_local: Vec3,
+    pole: Vec3,
+    pole_angle: f32,
+) {
+    if ref_local.length_squared() < 1e-12 {
+        return;
+    }
+    let origin = scene.world_matrix(bone.node).transform_point3(Vec3::ZERO);
+    let child_pos = scene.world_matrix(child.node).transform_point3(Vec3::ZERO);
+    let aim = (child_pos - origin).normalize_or_zero();
+    if aim.length_squared() < 1e-8 {
+        return;
+    }
+    let rot = quat_from_matrix(scene.world_matrix(bone.node));
+    let from = reject(rot * ref_local, aim);
+    let mut to = reject(pole - origin, aim);
+    if pole_angle.abs() > 1e-6 {
+        to = Quat::from_axis_angle(aim, pole_angle.to_radians()) * to;
+    }
+    twist_dir(scene, bone, aim, from, to);
+}
+
+fn twist_dir(scene: &mut Scene, bone: BoneId, axis: Vec3, from: Vec3, to: Vec3) {
+    if from.length_squared() < 1e-10 || to.length_squared() < 1e-10 {
+        return;
+    }
+    let from = from.normalize();
+    let to = to.normalize();
+    let mut angle = from.dot(to).clamp(-1.0, 1.0).acos();
+    if from.cross(to).dot(axis) < 0.0 {
+        angle = -angle;
+    }
+    if angle.abs() < 1e-6 {
+        return;
+    }
+    apply_world_delta_rot(scene, bone, Quat::from_axis_angle(axis, angle));
+}
+
 fn align_chain_to_pole(
     scene: &mut Scene,
     root: BoneId,
@@ -152,6 +202,8 @@ fn align_chain_to_pole(
     tip: BoneId,
     target: Vec3,
     pole: Vec3,
+    pole_angle: f32,
+    ref_local: Vec3,
 ) {
     let root_pos = scene.world_matrix(root.node).transform_point3(Vec3::ZERO);
     let mid_pos = scene.world_matrix(mid.node).transform_point3(Vec3::ZERO);
@@ -164,41 +216,32 @@ fn align_chain_to_pole(
         return;
     }
 
-    let mid_p = reject(mid_pos - root_pos, axis);
-    let pole_p = reject(pole - root_pos, axis);
-    if mid_p.length_squared() < 1e-10 || pole_p.length_squared() < 1e-10 {
-        return;
+    let mut from = reject(mid_pos - root_pos, axis);
+    if from.length_squared() < 1e-8 && ref_local.length_squared() > 1e-12 {
+        let rot = quat_from_matrix(scene.world_matrix(root.node));
+        from = reject(rot * ref_local, axis);
     }
-    let from = mid_p.normalize();
-    let to = pole_p.normalize();
-    let q = Quat::from_rotation_arc(from, to);
-    // Keep only twist around reach axis (avoid tilting the limb).
-    let twist = twist_around_axis(q, axis);
-    if (twist.xyz().length_squared() + (twist.w - 1.0) * (twist.w - 1.0)) < 1e-12 {
-        return;
+    let to = pole_in_plane(root_pos, target, pole, pole_angle);
+    twist_dir(scene, root, axis, from, to);
+}
+
+fn pole_in_plane(root: Vec3, target: Vec3, pole: Vec3, pole_angle: f32) -> Vec3 {
+    let dir = (target - root).normalize_or_zero();
+    if dir.length_squared() < 1e-8 {
+        return Vec3::ZERO;
     }
-    apply_world_delta_rot(scene, root, twist);
+    let mut bend = reject(pole - root, dir);
+    if bend.length_squared() < 1e-10 {
+        return Vec3::ZERO;
+    }
+    if pole_angle.abs() > 1e-6 {
+        bend = Quat::from_axis_angle(dir, pole_angle.to_radians()) * bend;
+    }
+    bend
 }
 
 fn reject(v: Vec3, axis: Vec3) -> Vec3 {
     v - axis * v.dot(axis)
-}
-
-fn twist_around_axis(q: Quat, axis: Vec3) -> Quat {
-    let axis = axis.normalize_or_zero();
-    if axis.length_squared() < 1e-8 {
-        return Quat::IDENTITY;
-    }
-    // Project quaternion rotation onto axis (swing-twist decomposition lite).
-    let r = Quat::from_xyzw(q.x, q.y, q.z, q.w).normalize();
-    let ra = Vec3::new(r.x, r.y, r.z);
-    let proj = axis * ra.dot(axis);
-    let twist = Quat::from_xyzw(proj.x, proj.y, proj.z, r.w).normalize();
-    if twist.length_squared() < 1e-12 {
-        Quat::IDENTITY
-    } else {
-        twist
-    }
 }
 
 fn two_bone_positions(
@@ -207,6 +250,7 @@ fn two_bone_positions(
     len2: f32,
     target: Vec3,
     pole: Vec3,
+    pole_angle: f32,
 ) -> (Vec3, Vec3) {
     let mut to_t = target - root;
     let mut dist = to_t.length();
@@ -219,9 +263,7 @@ fn two_bone_positions(
     let dist_c = dist.clamp(min_r, max_r - 1e-4);
     let dir = to_t / dist;
 
-    // Bend toward pole in the plane (dir, pole).
-    let pole_off = pole - root;
-    let mut bend = reject(pole_off, dir);
+    let mut bend = pole_in_plane(root, target, pole, pole_angle);
     if bend.length_squared() < 1e-10 {
         bend = orphan_perp(dir);
     }
