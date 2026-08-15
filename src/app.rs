@@ -2442,18 +2442,18 @@ fn inspector_panel_body(ui: &mut Ui, state: &mut AppState) {
                     }
                     ui.label("Length");
                     let mut len = c.length();
-                    let mut off = c.axis_offset();
+                    let mut off = c.offset();
                     if ui
                         .drag_float(&format!("col_l_{cid}"), &mut len, 0.001)
                         .changed()
                     {
-                        c.set_length_offset(len.clamp(0.001, 1.0), off.clamp(-0.5, 0.5));
+                        c.set_length_offset(len.clamp(0.001, 1.0), off);
                     }
-                    ui.label("Offset along axis");
+                    ui.label("Offset");
                     len = c.length();
-                    off = c.axis_offset();
+                    off = c.offset();
                     if ui
-                        .slider(&format!("col_o_{cid}"), &mut off, -0.5..=0.5)
+                        .vec3(&format!("col_o_{cid}"), &mut off, 0.001, Vec3::ZERO)
                         .changed()
                     {
                         c.set_length_offset(len.max(0.001), off);

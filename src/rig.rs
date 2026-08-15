@@ -1394,25 +1394,19 @@ impl BoneCollider {
         (self.b_local - self.a_local).length()
     }
 
-    /// Midpoint projected along the capsule axis, from bone origin along that axis.
-    pub fn axis_offset(&self) -> f32 {
-        let mut axis = (self.b_local - self.a_local).normalize_or_zero();
-        if axis.length_squared() < 1e-8 {
-            axis = Vec3::Y;
-        }
-        let mid = (self.a_local + self.b_local) * 0.5;
-        mid.dot(axis)
+    /// Capsule midpoint in bone local space (free 3-axis offset from the bone origin).
+    pub fn offset(&self) -> Vec3 {
+        (self.a_local + self.b_local) * 0.5
     }
 
-    pub fn set_length_offset(&mut self, length: f32, offset: f32) {
+    pub fn set_length_offset(&mut self, length: f32, offset: Vec3) {
         let mut axis = (self.b_local - self.a_local).normalize_or_zero();
         if axis.length_squared() < 1e-8 {
             axis = Vec3::Y;
         }
         let len = length.max(1e-4);
-        let mid = axis * offset;
-        self.a_local = mid - axis * (len * 0.5);
-        self.b_local = mid + axis * (len * 0.5);
+        self.a_local = offset - axis * (len * 0.5);
+        self.b_local = offset + axis * (len * 0.5);
     }
 }
 
