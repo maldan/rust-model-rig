@@ -187,16 +187,9 @@ pub struct SoftChain {
     pub inertia: f32,
     /// Radians from animated rest direction (cone).
     pub max_angle: f32,
-    /// Runtime Verlet state (world). Includes virtual tip as last particle.
-    pub(crate) prev_pos: Vec<Vec3>,
-    pub(crate) curr_pos: Vec<Vec3>,
-    /// Previous frame world matrix of soft root (`bones[0]`) for motion inheritance.
-    pub(crate) prev_root_world: glam::Mat4,
-    /// Soft-root world velocity (for inertia / fictitious force).
-    pub(crate) prev_root_vel: Vec3,
-    pub(crate) initialized: bool,
-    /// 1 just after Soft Grab release; decays each frame to soften spring snap-back.
-    pub(crate) grab_relax: f32,
+    /// Runtime Verlet simulation state (world space, incl. virtual tip
+    /// particle), owned by `mega-physics`.
+    pub(crate) sim: mega_physics::chain::Chain,
 }
 
 #[derive(Clone)]
@@ -889,12 +882,7 @@ impl RigDocument {
             damping: 2.5,
             inertia: 0.0,
             max_angle: 95f32.to_radians(),
-            prev_pos: Vec::new(),
-            curr_pos: Vec::new(),
-            prev_root_world: glam::Mat4::IDENTITY,
-            prev_root_vel: Vec3::ZERO,
-            initialized: false,
-            grab_relax: 0.0,
+            sim: mega_physics::chain::Chain::new(),
         });
         Ok(id)
     }
@@ -907,7 +895,7 @@ impl RigDocument {
         if let Some(c) = self.soft_chains.iter_mut().find(|c| c.id == chain_id) {
             c.enabled = enabled;
             if enabled {
-                c.initialized = false;
+                c.sim.reset();
             }
         }
     }
@@ -1229,7 +1217,7 @@ impl RigDocument {
 
     pub fn reset_soft_sim(&mut self) {
         for c in &mut self.soft_chains {
-            c.initialized = false;
+            c.sim.reset();
         }
     }
 

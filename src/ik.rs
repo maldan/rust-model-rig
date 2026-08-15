@@ -1,7 +1,11 @@
 //! Auto-IK pull via CCD (stable interactive posing).
+//!
+//! The actual joint-rotation math lives in `mega_render::ik`; this module
+//! only handles viewport picking / dragging and translates `BoneId` chains
+//! into calls against the render engine's node-based solver.
 
 use glam::{Quat, Vec2, Vec3};
-use mega_render::{GizmoAxis, Scene};
+use mega_render::{ccd_rotate_joint as render_ccd_rotate_joint, translate_bone_world, GizmoAxis, Scene};
 use mega_ui::Rect;
 
 use crate::gizmo::{gizmo_basis, pick_translate_axis};
@@ -9,7 +13,6 @@ use crate::pick::{ray_from_viewport, Ray};
 use crate::rig::{BoneId, RigDocument, TransformSpace};
 
 const CCD_ITERS: u32 = 16;
-const MAX_STEP_RAD: f32 = 0.45;
 /// Effector + this many ancestors (Blender-like short Auto-IK).
 const IK_DEPTH: usize = 5;
 
@@ -95,7 +98,7 @@ pub fn apply_ik_pull(scene: &mut Scene, drag: &IkPullDrag, viewport: Rect, curso
     let tip = *drag.chain.last().unwrap();
     for _ in 0..CCD_ITERS {
         for i in (0..drag.chain.len() - 1).rev() {
-            ccd_rotate_joint(scene, drag.chain[i], tip, target, 1.0);
+            render_ccd_rotate_joint(scene, drag.chain[i].node, tip.node, target, 1.0);
         }
     }
     // Free the root so tip can reach anywhere (no hard stop at chain length).
@@ -125,21 +128,7 @@ pub(crate) fn pull_root_to_close_gap(
     if residual.length_squared() < 1e-12 {
         return;
     }
-    translate_bone_world(scene, root, residual);
-}
-
-pub(crate) fn translate_bone_world(scene: &mut Scene, bone: BoneId, world_delta: Vec3) {
-    let parent_world = scene
-        .nodes
-        .get(bone.node)
-        .and_then(|n| n.parent)
-        .map(|p| scene.world_matrix(p))
-        .unwrap_or(glam::Mat4::IDENTITY);
-    let Some(n) = scene.nodes.get_mut(bone.node) else {
-        return;
-    };
-    let world = parent_world.transform_point3(n.local.translation) + world_delta;
-    n.local.translation = parent_world.inverse().transform_point3(world);
+    translate_bone_world(scene, root.node, residual);
 }
 
 pub(crate) struct MovePlane {
@@ -252,62 +241,9 @@ pub(crate) fn target_from_plane(
 }
 
 /// Rotate `joint` so the chain tip moves toward `target`. `weight` 0..1 scales the step.
-pub(crate) fn ccd_rotate_joint(
-    scene: &mut Scene,
-    joint: BoneId,
-    tip: BoneId,
-    target: Vec3,
-    weight: f32,
-) {
-    if weight < 1e-4 {
-        return;
-    }
-    let joint_pos = scene.world_matrix(joint.node).transform_point3(Vec3::ZERO);
-    let tip_pos = scene.world_matrix(tip.node).transform_point3(Vec3::ZERO);
-    let to_tip = (tip_pos - joint_pos).normalize_or_zero();
-    let to_tgt = (target - joint_pos).normalize_or_zero();
-    if to_tip.length_squared() < 1e-10 || to_tgt.length_squared() < 1e-10 {
-        return;
-    }
-
-    let rot = clamped_arc(to_tip, to_tgt, MAX_STEP_RAD * weight);
-    if (rot.xyz().length_squared() + (rot.w - 1.0) * (rot.w - 1.0)) < 1e-12 {
-        return;
-    }
-
-    let parent_world = scene
-        .nodes
-        .get(joint.node)
-        .and_then(|n| n.parent)
-        .map(|p| scene.world_matrix(p))
-        .unwrap_or(glam::Mat4::IDENTITY);
-    let parent_rot = quat_from_matrix(parent_world);
-    let Some(node) = scene.nodes.get_mut(joint.node) else {
-        return;
-    };
-    let world_r = parent_rot * node.local.rotation;
-    let new_world = (rot * world_r).normalize();
-    node.local.rotation = (parent_rot.inverse() * new_world).normalize();
-}
-
-fn clamped_arc(from: Vec3, to: Vec3, max_rad: f32) -> Quat {
-    let f = from.normalize_or_zero();
-    let t = to.normalize_or_zero();
-    let dot = f.dot(t).clamp(-1.0, 1.0);
-    let angle = dot.acos();
-    if angle < 1e-5 {
-        return Quat::IDENTITY;
-    }
-    let axis = f.cross(t);
-    if axis.length_squared() < 1e-10 {
-        return Quat::IDENTITY;
-    }
-    Quat::from_axis_angle(axis.normalize(), angle.min(max_rad))
-}
-
-pub(crate) fn quat_from_matrix(m: glam::Mat4) -> Quat {
-    let (_, r, _) = m.to_scale_rotation_translation();
-    r.normalize()
+/// Thin `BoneId` wrapper over the render engine's node-based CCD step.
+pub(crate) fn ccd_rotate_joint(scene: &mut Scene, joint: BoneId, tip: BoneId, target: Vec3, weight: f32) {
+    render_ccd_rotate_joint(scene, joint.node, tip.node, target, weight);
 }
 
 fn ray_plane_point(ray: &Ray, point: Vec3, normal: Vec3) -> Option<Vec3> {

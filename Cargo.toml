@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+mega-physics = { path = "../../../rust_lib/mega/physics" }
 mega-render = { path = "../../../rust_lib/mega/render" }
 mega-ui = { path = "../../../rust_lib/mega/ui", features = ["wgpu"] }
 glam = "0.33.2"

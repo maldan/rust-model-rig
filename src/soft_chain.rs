@@ -1,22 +1,29 @@
-//! Soft bone chains: world-gravity Verlet + spring to animated pose + support plane.
-//! Capsule↔capsule soft collision (no particle↔capsule). Soft-grab for testing.
+//! Adapter between the rig's bones and the generic particle-chain simulation
+//! in `mega-physics` (`mega_physics::chain`): world-gravity Verlet + spring to
+//! animated pose + support plane + capsule↔capsule soft collision. The
+//! physics lib knows nothing about bones/scenes — this file is entirely
+//! about translating bone poses into [`mega_physics::chain::ChainFrame`]
+//! inputs and turning simulated particle positions back into bone rotations.
+//!
+//! Soft-grab (interactive drag) is app-side tooling on top of
+//! [`mega_physics::chain::PullTarget`].
 
 use glam::{Quat, Vec2, Vec3};
-use mega_render::{LineOpts, Scene, Transform};
+use mega_physics::chain::{self, Chain, ChainCapsule, ChainFrame, PreparedChain, PullTarget};
+use mega_physics::Isometry;
+use mega_render::{quat_from_matrix, LineOpts, Scene, Transform};
 use mega_ui::Rect;
 use std::collections::HashMap;
 use std::f32::consts::TAU;
 
-use crate::ik::quat_from_matrix;
 use crate::pick::{self, Ray};
 use crate::rig::{AppMode, BoneCollider, BoneId, RigDocument, SoftChain};
 
 const CONSTRAINT_ITERS: u32 = 6;
 const SUBSTEPS: u32 = 4;
+const COLLISION_PASSES: u32 = 3;
 /// How hard Soft Grab pulls toward the cursor per constraint pass (0–1).
 const GRAB_BLEND: f32 = 0.55;
-/// Grab corrections move `prev` with `curr` (1 = no Verlet impulse from dragging).
-const GRAB_PREV_FOLLOW: f32 = 1.0;
 /// Falloff along root→grab (`< 1` = mid-chain feels more of the pull).
 const GRAB_CHAIN_POWER: f32 = 0.5;
 
@@ -24,7 +31,7 @@ const GRAB_CHAIN_POWER: f32 = 0.5;
 #[derive(Clone, Debug)]
 pub struct SoftGrabDrag {
     pub chain_id: u32,
-    /// Index into `SoftChain::curr_pos` (≥ 1; root is pinned to body).
+    /// Index into the chain's simulated particles (≥ 1; root is pinned to body).
     pub particle: usize,
     /// Bone to select while grabbing (tip particle → last bone).
     pub bone: BoneId,
@@ -33,27 +40,10 @@ pub struct SoftGrabDrag {
     pub plane_normal: Vec3,
 }
 
-struct WorldCapsule {
-    a: Vec3,
-    b: Vec3,
-    radius: f32,
-    softness: f32,
-    /// Index into the soft-chains slice being solved, if collider bone is soft.
-    chain_idx: Option<usize>,
-}
-
-struct ChainScratch {
-    rest: Vec<Vec3>,
-    rest_dir: Vec<Vec3>,
-    seg_len: Vec<f32>,
-    support_n: Vec3,
-    max_angle: f32,
-    accel: Vec3,
+/// Extra per-chain data needed to place bone colliders that ride along a
+/// soft chain's particles (see [`build_live_capsules`]).
+struct ChainAxis {
     tip_local_axis: Vec3,
-    h: f32,
-    h2: f32,
-    vel_keep: f32,
-    stiff: f32,
 }
 
 /// Run all enabled soft chains (Pose only). Call after IK.
@@ -76,36 +66,39 @@ pub fn evaluate_soft_chains(
         }
     }
 
-    let mut scratches: Vec<Option<ChainScratch>> = (0..chains.len())
-        .map(|i| {
-            if chains[i].enabled {
-                prepare_chain(scene, &mut chains[i], dt)
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    // While Soft Grab holds a chain: no rest-spring fight (avoids stored snap energy).
-    if let Some(g) = grab {
-        for (i, chain) in chains.iter().enumerate() {
-            if chain.id == g.chain_id {
-                if let Some(s) = scratches[i].as_mut() {
-                    s.stiff = 0.0;
-                }
-            }
+    let mut scratches: Vec<Option<PreparedChain>> = Vec::with_capacity(chains.len());
+    let mut axes: Vec<Option<ChainAxis>> = Vec::with_capacity(chains.len());
+    for c in &mut chains {
+        if c.enabled {
+            let (s, a) = prepare_chain(scene, c, dt);
+            scratches.push(s);
+            axes.push(a);
+        } else {
+            scratches.push(None);
+            axes.push(None);
         }
     }
+
+    // While Soft Grab holds a chain: no rest-spring fight (avoids stored snap energy).
+    // (Handled per-substep below by passing `pull` only for the grabbed chain.)
 
     for _ in 0..SUBSTEPS {
         for i in 0..chains.len() {
             if let Some(scratch) = scratches[i].as_ref() {
-                integrate_chain(&mut chains[i], scratch);
+                chains[i].sim.integrate(scratch);
             }
         }
         for i in 0..chains.len() {
             if let Some(scratch) = scratches[i].as_ref() {
-                constrain_chain(&mut chains[i], scratch, grab);
+                let pull = grab
+                    .filter(|g| g.chain_id == chains[i].id)
+                    .map(|g| PullTarget {
+                        particle: g.particle,
+                        target: g.target,
+                        blend: GRAB_BLEND,
+                        chain_power: GRAB_CHAIN_POWER,
+                    });
+                chains[i].sim.constrain(scratch, CONSTRAINT_ITERS, pull);
             }
         }
         // Capsule↔capsule from *current* particle poses (lockstep) — stable, no particle hits.
@@ -113,14 +106,14 @@ pub fn evaluate_soft_chains(
         // Held grab is kinematic: kill Verlet velocity so release can't shoot.
         if let Some(g) = grab {
             if let Some(chain) = chains.iter_mut().find(|c| c.id == g.chain_id) {
-                zero_chain_verlet_vel(chain);
+                chain.sim.zero_velocity();
             }
         }
     }
 
     for i in 0..chains.len() {
-        if let Some(scratch) = scratches[i].as_ref() {
-            write_chain_bones(scene, &chains[i], scratch);
+        if let (Some(scratch), Some(axis)) = (scratches[i].as_ref(), axes[i].as_ref()) {
+            write_chain_bones(scene, &chains[i], scratch, axis);
         }
     }
 
@@ -176,13 +169,13 @@ fn pick_soft_particle(
         }
         let n_bones = chain.bones.len();
         let n = n_bones + 1;
-        let use_sim = chain.initialized && chain.curr_pos.len() == n;
+        let use_sim = chain.sim.is_initialized() && chain.sim.positions().len() == n;
         let scale: f32 = chain.lengths.iter().copied().sum::<f32>() + chain.tip_length;
         let radius = (scale * 0.12).clamp(0.02, 0.12);
 
         for i in 1..n {
             let p = if use_sim {
-                chain.curr_pos[i]
+                chain.sim.positions()[i]
             } else if i < n_bones {
                 scene
                     .world_matrix(chain.bones[i].node)
@@ -247,49 +240,14 @@ fn ray_plane(ray: &Ray, point: Vec3, normal: Vec3) -> Option<Vec3> {
     Some(ray.origin + ray.dir * t)
 }
 
-fn apply_soft_grab(chain: &mut SoftChain, grab: &SoftGrabDrag) {
-    if chain.id != grab.chain_id {
-        return;
-    }
-    let i = grab.particle;
-    let n = chain.curr_pos.len();
-    if i == 0 || i >= n {
-        return;
-    }
-    // Move the whole chain toward the cursor: full pull at the grabbed joint,
-    // falloff toward the root, tip-beyond-grab follows with the same delta.
-    let delta = (grab.target - chain.curr_pos[i]) * GRAB_BLEND;
-    if delta.length_squared() < 1e-14 {
-        return;
-    }
-    let inv_i = 1.0 / i as f32;
-    for j in 1..n {
-        let w = if j <= i {
-            (j as f32 * inv_i).powf(GRAB_CHAIN_POWER)
-        } else {
-            1.0
-        };
-        let corr = delta * w;
-        chain.curr_pos[j] += corr;
-        chain.prev_pos[j] += corr * GRAB_PREV_FOLLOW;
-    }
-}
-
 /// Kill grab-induced Verlet velocity so release doesn't shoot the chain.
 pub fn release_soft_grab(rig: &mut RigDocument, grab: &SoftGrabDrag) {
     let Some(chain) = rig.soft_chains.iter_mut().find(|c| c.id == grab.chain_id) else {
         return;
     };
-    zero_chain_verlet_vel(chain);
+    chain.sim.zero_velocity();
     // Soften spring snap-back for a short window after release.
-    chain.grab_relax = 1.0;
-}
-
-fn zero_chain_verlet_vel(chain: &mut SoftChain) {
-    let n = chain.curr_pos.len().min(chain.prev_pos.len());
-    for j in 1..n {
-        chain.prev_pos[j] = chain.curr_pos[j];
-    }
+    chain.sim.begin_relax();
 }
 
 fn restore_soft_bind(
@@ -307,10 +265,19 @@ fn restore_soft_bind(
     }
 }
 
-fn prepare_chain(scene: &mut Scene, chain: &mut SoftChain, dt: f32) -> Option<ChainScratch> {
+fn isometry_from_mat4(m: glam::Mat4) -> Isometry {
+    let (_, rotation, translation) = m.to_scale_rotation_translation();
+    Isometry::new(translation, rotation)
+}
+
+fn prepare_chain(
+    scene: &mut Scene,
+    chain: &mut SoftChain,
+    dt: f32,
+) -> (Option<PreparedChain>, Option<ChainAxis>) {
     let n_bones = chain.bones.len();
     if n_bones < 2 {
-        return None;
+        return (None, None);
     }
     let n = n_bones + 1;
 
@@ -333,91 +300,6 @@ fn prepare_chain(scene: &mut Scene, chain: &mut SoftChain, dt: f32) -> Option<Ch
         rest.push(rest[n_bones - 1] + tip_dir * chain.tip_length.max(1e-4));
     }
 
-    let mut rest_dir = Vec::with_capacity(n);
-    rest_dir.push(Vec3::ZERO);
-    for i in 1..n {
-        rest_dir.push((rest[i] - rest[i - 1]).normalize_or_zero());
-    }
-
-    let root_world = scene.world_matrix(chain.bones[0].node);
-    let (_, _, curr_t) = root_world.to_scale_rotation_translation();
-    let mut fictitious = Vec3::ZERO;
-
-    if !chain.initialized || chain.curr_pos.len() != n {
-        chain.prev_pos = rest.clone();
-        chain.curr_pos = rest.clone();
-        chain.prev_root_world = root_world;
-        chain.prev_root_vel = Vec3::ZERO;
-        chain.initialized = true;
-    } else {
-        let (_, _, prev_t) = chain.prev_root_world.to_scale_rotation_translation();
-        let trans = curr_t - prev_t;
-        let dt_safe = dt.max(1e-4);
-        let root_vel = trans / dt_safe;
-        let mut root_accel = (root_vel - chain.prev_root_vel) / dt_safe;
-        chain.prev_root_vel = root_vel;
-
-        let scale: f32 = chain.lengths.iter().copied().sum::<f32>() + chain.tip_length;
-        let inertia = chain.inertia.clamp(0.0, 20.0);
-        let teleport = trans.length() > (scale * 2.5).max(0.2);
-
-        if teleport {
-            chain.prev_pos = rest.clone();
-            chain.curr_pos = rest.clone();
-            chain.prev_root_vel = Vec3::ZERO;
-            root_accel = Vec3::ZERO;
-        } else {
-            let delta = root_world * chain.prev_root_world.inverse();
-            for i in 1..n {
-                chain.curr_pos[i] = delta.transform_point3(chain.curr_pos[i]);
-                chain.prev_pos[i] = delta.transform_point3(chain.prev_pos[i]);
-            }
-
-            let t_len = trans.length();
-            if inertia > 1e-6 && t_len > 1e-8 {
-                let max_lag = (scale * 0.4 * inertia.max(1.0)).max(0.012);
-                let mut lag = trans * inertia;
-                if lag.length() > max_lag {
-                    lag = lag.normalize() * max_lag;
-                }
-                for i in 1..n {
-                    chain.curr_pos[i] -= lag;
-                    chain.prev_pos[i] -= lag;
-                }
-            }
-        }
-
-        let max_a = ((scale * 80.0).max(15.0)).min(100.0);
-        if root_accel.length_squared() > max_a * max_a {
-            root_accel = root_accel.normalize() * max_a;
-        }
-        fictitious = -root_accel * inertia;
-        chain.prev_root_world = root_world;
-    }
-
-    chain.curr_pos[0] = rest[0];
-    chain.prev_pos[0] = rest[0];
-
-    let gravity = Vec3::new(0.0, -chain.gravity, 0.0);
-    let h = dt / SUBSTEPS as f32;
-    let h2 = h * h;
-    let relax = chain.grab_relax.clamp(0.0, 1.0);
-    let mut damp = chain.damping.max(0.0);
-    let mut stiff = chain.stiffness.max(0.0);
-    if relax > 1e-4 {
-        // Soft settle after Soft Grab: little spring snap, extra damping.
-        stiff *= 1.0 - 0.95 * relax;
-        damp *= 1.0 + 5.0 * relax;
-        chain.grab_relax = (relax - dt * 2.5).max(0.0);
-    }
-    let vel_keep = (-damp * h).exp();
-
-    let anchor_rot = quat_from_matrix(scene.world_matrix(chain.anchor.node));
-    let mut support_n = (anchor_rot * chain.support_normal_local).normalize_or_zero();
-    if support_n.length_squared() < 1e-8 {
-        support_n = Vec3::Z;
-    }
-
     let mut seg_len = Vec::with_capacity(n);
     seg_len.push(0.0);
     for i in 1..n_bones {
@@ -425,12 +307,21 @@ fn prepare_chain(scene: &mut Scene, chain: &mut SoftChain, dt: f32) -> Option<Ch
     }
     seg_len.push(chain.tip_length.max(1e-4));
 
+    let root = isometry_from_mat4(scene.world_matrix(chain.bones[0].node));
+
+    let anchor_rot = quat_from_matrix(scene.world_matrix(chain.anchor.node));
+    let mut support_n = (anchor_rot * chain.support_normal_local).normalize_or_zero();
+    if support_n.length_squared() < 1e-8 {
+        support_n = Vec3::Z;
+    }
+
     let tip_local_axis = {
         let tip = chain.bones[n_bones - 1];
         let tip_m = scene.world_matrix(tip.node);
         let (_, tip_rot, _) = tip_m.to_scale_rotation_translation();
         let inv = tip_rot.normalize().inverse();
-        let axis = inv * rest_dir[n_bones];
+        let rest_tip_dir = (rest[n - 1] - rest[n - 2]).normalize_or_zero();
+        let axis = inv * rest_tip_dir;
         if axis.length_squared() > 1e-8 {
             axis.normalize()
         } else {
@@ -438,127 +329,38 @@ fn prepare_chain(scene: &mut Scene, chain: &mut SoftChain, dt: f32) -> Option<Ch
         }
     };
 
-    Some(ChainScratch {
+    let support_point = rest[0];
+    let frame = ChainFrame {
         rest,
-        rest_dir,
         seg_len,
-        support_n,
-        max_angle: chain.max_angle.max(0.05),
-        accel: gravity + fictitious,
-        tip_local_axis,
-        h,
-        h2,
-        vel_keep,
-        stiff,
-    })
+        root,
+        gravity: chain.gravity,
+        stiffness: chain.stiffness,
+        damping: chain.damping,
+        inertia: chain.inertia,
+        max_angle: chain.max_angle,
+        support_point,
+        support_normal: support_n,
+    };
+    let scratch = chain.sim.prepare(&frame, dt, SUBSTEPS);
+
+    (Some(scratch), Some(ChainAxis { tip_local_axis }))
 }
 
-fn integrate_chain(chain: &mut SoftChain, scratch: &ChainScratch) {
-    let n = chain.curr_pos.len();
-    chain.curr_pos[0] = scratch.rest[0];
-    chain.prev_pos[0] = scratch.rest[0];
-
-    for i in 1..n {
-        let parent = chain.curr_pos[i - 1];
-        let rest_target = if scratch.rest_dir[i].length_squared() > 1e-8 {
-            parent + scratch.rest_dir[i] * scratch.seg_len[i]
-        } else {
-            scratch.rest[i]
-        };
-        let vel = chain.curr_pos[i] - chain.prev_pos[i];
-        let spring = (rest_target - chain.curr_pos[i]) * scratch.stiff;
-        let next = chain.curr_pos[i] + vel * scratch.vel_keep + (scratch.accel + spring) * scratch.h2;
-        chain.prev_pos[i] = chain.curr_pos[i];
-        chain.curr_pos[i] = next;
-    }
-}
-
-fn constrain_chain(chain: &mut SoftChain, scratch: &ChainScratch, grab: Option<&SoftGrabDrag>) {
-    let n = chain.curr_pos.len();
-    let plane_p = scratch.rest[0];
-    let max_angle = scratch.max_angle;
-    let support_n = scratch.support_n;
-
-    for _ in 0..CONSTRAINT_ITERS {
-        chain.curr_pos[0] = scratch.rest[0];
-        // Pull the chain first; length/angle then reshape it as a bend.
-        if let Some(g) = grab {
-            apply_soft_grab(chain, g);
-            chain.curr_pos[0] = scratch.rest[0];
-        }
-        for i in 1..n {
-            let parent = chain.curr_pos[i - 1];
-            let len = scratch.seg_len[i];
-            let rd = scratch.rest_dir[i];
-            let old = chain.curr_pos[i];
-
-            let mut p = project_length(old, parent, len, rd, support_n);
-
-            let side = (p - plane_p).dot(support_n);
-            if side < 0.0 {
-                p += support_n * (-side);
-                p = project_length(p, parent, len, rd, support_n);
-            }
-
-            if rd.length_squared() > 1e-8 {
-                let mut dir = (p - parent).normalize_or_zero();
-                if dir.length_squared() > 1e-8 {
-                    let dot = rd.dot(dir).clamp(-1.0, 1.0);
-                    let ang = dot.acos();
-                    if ang > max_angle {
-                        let axis = rd.cross(dir);
-                        if axis.length_squared() > 1e-10 {
-                            let q = Quat::from_axis_angle(axis.normalize(), max_angle);
-                            dir = q * rd;
-                            p = parent + dir * len;
-                        } else {
-                            p = parent + rd * len;
-                        }
-                        p = clamp_to_halfspace(p, plane_p, support_n);
-                        p = project_length(p, parent, len, rd, support_n);
-                    }
-                }
-            }
-
-            chain.curr_pos[i] = p;
-            let corr = p - old;
-            let clen = corr.length();
-            // While Soft Grab holds (or just released), fully absorb constraint jumps
-            // so length/angle settle doesn't inject a shoot velocity.
-            let holding = grab.is_some_and(|g| g.chain_id == chain.id) || chain.grab_relax > 0.05;
-            if holding {
-                chain.prev_pos[i] += corr;
-            } else {
-                let shock = (len * 0.2).max(1e-4);
-                if clen > shock {
-                    chain.prev_pos[i] += corr * ((clen - shock) / clen);
-                }
-            }
-
-            if (p - plane_p).dot(support_n) < 1e-4 {
-                let vel = chain.curr_pos[i] - chain.prev_pos[i];
-                let vn = vel.dot(support_n);
-                if vn < 0.0 {
-                    chain.prev_pos[i] = p - (vel - support_n * vn);
-                }
-            }
-        }
-    }
-}
-
-fn write_chain_bones(scene: &mut Scene, chain: &SoftChain, scratch: &ChainScratch) {
+fn write_chain_bones(scene: &mut Scene, chain: &SoftChain, _scratch: &PreparedChain, axis: &ChainAxis) {
     let n_bones = chain.bones.len();
-    let n = chain.curr_pos.len();
+    let pos = chain.sim.positions();
+    let n = pos.len();
     for i in 0..n_bones {
         if i + 1 < n_bones {
-            swing_bone_to(scene, chain.bones[i], chain.bones[i + 1], chain.curr_pos[i + 1]);
+            swing_bone_to(scene, chain.bones[i], chain.bones[i + 1], pos[i + 1]);
         } else {
             let tip = chain.bones[i];
             let m = scene.world_matrix(tip.node);
             let origin = m.transform_point3(Vec3::ZERO);
             let (_, tip_rot, _) = m.to_scale_rotation_translation();
-            let from = (tip_rot.normalize() * scratch.tip_local_axis).normalize_or_zero();
-            let to = (chain.curr_pos[n - 1] - origin).normalize_or_zero();
+            let from = (tip_rot.normalize() * axis.tip_local_axis).normalize_or_zero();
+            let to = (pos[n - 1] - origin).normalize_or_zero();
             apply_swing(scene, tip, from, to);
         }
     }
@@ -568,9 +370,9 @@ fn write_chain_bones(scene: &mut Scene, chain: &SoftChain, scratch: &ChainScratc
 fn build_live_capsules(
     scene: &Scene,
     chains: &[SoftChain],
-    scratches: &[Option<ChainScratch>],
+    scratches: &[Option<PreparedChain>],
     colliders: &[BoneCollider],
-) -> Vec<WorldCapsule> {
+) -> Vec<ChainCapsule> {
     let mut out = Vec::new();
     for col in colliders {
         if !col.enabled {
@@ -592,12 +394,12 @@ fn build_live_capsules(
         }
         if !placed {
             let m = scene.world_matrix(col.bone.node);
-            out.push(WorldCapsule {
+            out.push(ChainCapsule {
                 a: m.transform_point3(col.a_local),
                 b: m.transform_point3(col.b_local),
                 radius: col.radius.max(1e-4),
                 softness: col.softness.clamp(0.0, 1.0),
-                chain_idx: None,
+                chain: None,
             });
         }
     }
@@ -609,13 +411,13 @@ fn capsule_from_soft_bone(
     bone_idx: usize,
     col: &BoneCollider,
     chain_idx: usize,
-) -> Option<WorldCapsule> {
-    if bone_idx >= chain.curr_pos.len() {
+) -> Option<ChainCapsule> {
+    let positions = chain.sim.positions();
+    if bone_idx >= positions.len() {
         return None;
     }
-    let origin = chain.curr_pos[bone_idx];
-    let next = chain
-        .curr_pos
+    let origin = positions[bone_idx];
+    let next = positions
         .get(bone_idx + 1)
         .copied()
         .unwrap_or(origin + Vec3::Y * 0.01);
@@ -628,181 +430,31 @@ fn capsule_from_soft_bone(
         local_axis = Vec3::Y;
     }
     let rot = Quat::from_rotation_arc(local_axis, world_axis);
-    Some(WorldCapsule {
+    Some(ChainCapsule {
         a: origin + rot * col.a_local,
         b: origin + rot * col.b_local,
         radius: col.radius.max(1e-4),
         softness: col.softness.clamp(0.0, 1.0),
-        chain_idx: Some(chain_idx),
+        chain: Some(chain_idx),
     })
 }
 
 fn resolve_capsule_capsule(
     scene: &Scene,
     chains: &mut [SoftChain],
-    scratches: &[Option<ChainScratch>],
-    colliders: &[BoneCollider],
-) {
-    // A couple of soft passes so large radii actually settle within the substep.
-    for _ in 0..3 {
-        resolve_capsule_capsule_once(scene, chains, scratches, colliders);
-    }
-}
-
-fn resolve_capsule_capsule_once(
-    scene: &Scene,
-    chains: &mut [SoftChain],
-    scratches: &[Option<ChainScratch>],
+    scratches: &[Option<PreparedChain>],
     colliders: &[BoneCollider],
 ) {
     let caps = build_live_capsules(scene, chains, scratches, colliders);
     if caps.len() < 2 {
         return;
     }
-
-    let mut pushes = vec![Vec3::ZERO; chains.len()];
-
-    for i in 0..caps.len() {
-        for j in (i + 1)..caps.len() {
-            let a = &caps[i];
-            let b = &caps[j];
-            if a.chain_idx.is_some() && a.chain_idx == b.chain_idx {
-                continue;
-            }
-            if a.chain_idx.is_none() && b.chain_idx.is_none() {
-                continue;
-            }
-
-            let (pa, pb) = closest_points_segments(a.a, a.b, b.a, b.b);
-            let delta = pa - pb;
-            let dist = delta.length();
-            let min_d = a.radius + b.radius;
-            // Tiny slack only — radius must dominate overlap depth.
-            let slack = (0.004 * min_d).min(0.002);
-            if dist + 1e-6 >= min_d - slack {
-                continue;
-            }
-            let depth = (min_d - slack) - dist;
-            if depth <= 1e-6 {
-                continue;
-            }
-
-            let n = if dist > 1e-5 {
-                delta / dist
-            } else {
-                let mid_a = (a.a + a.b) * 0.5;
-                let mid_b = (b.a + b.b) * 0.5;
-                let mut d = mid_a - mid_b;
-                if d.length_squared() < 1e-10 {
-                    d = Vec3::X;
-                }
-                d.normalize()
-            };
-
-            // Softness = how much of the overlap to peel off this pass.
-            // 0 → gentle (~20%), 1 → firm (~75%). Still not a hard snap.
-            let soft = (0.5 * (a.softness + b.softness)).clamp(0.0, 1.0);
-            let gain = 0.20 + 0.55 * soft;
-            let push = depth * gain;
-
-            match (a.chain_idx, b.chain_idx) {
-                (Some(ca), Some(cb)) => {
-                    pushes[ca] += n * (push * 0.5);
-                    pushes[cb] -= n * (push * 0.5);
-                }
-                (Some(ca), None) => {
-                    pushes[ca] += n * push;
-                }
-                (None, Some(cb)) => {
-                    pushes[cb] -= n * push;
-                }
-                _ => {}
-            }
-        }
-    }
-
-    for (ci, push) in pushes.into_iter().enumerate() {
-        if push.length_squared() < 1e-12 {
-            continue;
-        }
-        let Some(scratch) = scratches[ci].as_ref() else {
-            continue;
-        };
-        apply_chain_separation(&mut chains[ci], scratch, push);
-    }
-}
-
-fn apply_chain_separation(chain: &mut SoftChain, scratch: &ChainScratch, push: Vec3) {
-    let n = chain.curr_pos.len();
-    if n < 2 {
-        return;
-    }
-    let plane_p = scratch.rest[0];
-    for i in 1..n {
-        let w = i as f32 / (n - 1) as f32;
-        let old = chain.curr_pos[i];
-        let mut p = old + push * (0.35 + 0.65 * w);
-        let parent = chain.curr_pos[i - 1];
-        let len = scratch.seg_len[i];
-        let rd = scratch.rest_dir[i];
-        p = project_length(p, parent, len, rd, scratch.support_n);
-        p = clamp_to_halfspace(p, plane_p, scratch.support_n);
-        // Full absorb — separation must not inject Verlet velocity (that thrashed).
-        let corr = p - old;
-        chain.curr_pos[i] = p;
-        chain.prev_pos[i] += corr;
-    }
-    chain.curr_pos[0] = scratch.rest[0];
-    chain.prev_pos[0] = scratch.rest[0];
-}
-
-fn project_length(p: Vec3, parent: Vec3, len: f32, fallback: Vec3, support_n: Vec3) -> Vec3 {
-    let mut d = p - parent;
-    if d.length_squared() < 1e-12 {
-        d = if fallback.length_squared() > 1e-8 {
-            fallback * len
-        } else {
-            support_n * len
-        };
-    } else {
-        d = d.normalize() * len;
-    }
-    parent + d
-}
-
-fn closest_points_segments(a0: Vec3, a1: Vec3, b0: Vec3, b1: Vec3) -> (Vec3, Vec3) {
-    let da = a1 - a0;
-    let db = b1 - b0;
-    let r = a0 - b0;
-    let aa = da.dot(da).max(1e-12);
-    let ee = db.dot(db).max(1e-12);
-    let bb = da.dot(db);
-    let cc = da.dot(r);
-    let ff = db.dot(r);
-
-    let denom = aa * ee - bb * bb;
-    let (mut s, mut t) = if denom.abs() > 1e-10 {
-        (
-            ((bb * ff - cc * ee) / denom).clamp(0.0, 1.0),
-            ((aa * ff - bb * cc) / denom).clamp(0.0, 1.0),
-        )
-    } else {
-        (0.0, (ff / ee).clamp(0.0, 1.0))
-    };
-
-    let pa = a0 + da * s;
-    t = ((pa - b0).dot(db) / ee).clamp(0.0, 1.0);
-    let pb = b0 + db * t;
-    s = ((pb - a0).dot(da) / aa).clamp(0.0, 1.0);
-    (a0 + da * s, b0 + db * t)
-}
-
-fn clamp_to_halfspace(p: Vec3, plane_p: Vec3, n: Vec3) -> Vec3 {
-    let side = (p - plane_p).dot(n);
-    if side < 0.0 {
-        p + n * (-side)
-    } else {
-        p
+    // `chain::resolve_capsule_collisions` operates on `Chain` + scratch slices
+    // aligned by index; unpack/repack the `sim` field to satisfy borrowing.
+    let mut sims: Vec<Chain> = chains.iter_mut().map(|c| std::mem::take(&mut c.sim)).collect();
+    chain::resolve_capsule_collisions(&mut sims, scratches, &caps, COLLISION_PASSES);
+    for (c, sim) in chains.iter_mut().zip(sims.into_iter()) {
+        c.sim = sim;
     }
 }
 
@@ -852,11 +504,12 @@ pub fn draw_soft_helpers(scene: &mut Scene, rig: &RigDocument) {
         return;
     }
     for chain in &rig.soft_chains {
-        if !chain.enabled || chain.curr_pos.len() < 2 {
+        let pos = chain.sim.positions();
+        if !chain.enabled || pos.len() < 2 {
             continue;
         }
         let col = [0.35, 0.85, 1.0, 0.85];
-        for w in chain.curr_pos.windows(2) {
+        for w in pos.windows(2) {
             scene.debug.line(
                 w[0],
                 w[1],
@@ -865,8 +518,8 @@ pub fn draw_soft_helpers(scene: &mut Scene, rig: &RigDocument) {
         }
         let anchor_rot = quat_from_matrix(scene.world_matrix(chain.anchor.node));
         let n = (anchor_rot * chain.support_normal_local).normalize_or_zero();
-        if n.length_squared() > 1e-8 && !chain.curr_pos.is_empty() {
-            let p = chain.curr_pos[0];
+        if n.length_squared() > 1e-8 && !pos.is_empty() {
+            let p = pos[0];
             scene.debug.line(
                 p,
                 p + n * 0.08,
@@ -883,10 +536,11 @@ pub fn draw_soft_grab(scene: &mut Scene, rig: &RigDocument, grab: &SoftGrabDrag)
     let Some(chain) = rig.soft_chains.iter().find(|c| c.id == grab.chain_id) else {
         return;
     };
-    if grab.particle >= chain.curr_pos.len() {
+    let pos = chain.sim.positions();
+    if grab.particle >= pos.len() {
         return;
     }
-    let p = chain.curr_pos[grab.particle];
+    let p = pos[grab.particle];
     let col = [1.0, 0.85, 0.25, 0.95];
     scene.debug.sphere(p, 0.018, col, false);
     scene.debug.line(

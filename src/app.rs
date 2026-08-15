@@ -2381,7 +2381,7 @@ fn inspector_panel_body(ui: &mut Ui, state: &mut AppState) {
                     .slider(&format!("soft_g_{cid}"), &mut c.gravity, 0.0..=40.0)
                     .changed()
                 {
-                    c.initialized = false;
+                    c.sim.reset();
                 }
                 ui.label("Stiffness (1/s²)");
                 let _ = ui.slider(&format!("soft_k_{cid}"), &mut c.stiffness, 0.0..=200.0);
