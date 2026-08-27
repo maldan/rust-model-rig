@@ -335,10 +335,13 @@ fn prepare_chain(
         seg_len,
         root,
         gravity: chain.gravity,
+        wind: Vec3::ZERO,
         stiffness: chain.stiffness,
         damping: chain.damping,
         inertia: chain.inertia,
         max_angle: chain.max_angle,
+        max_angle_scale: Vec::new(),
+        stretch: 0.0,
         support_point,
         support_normal: support_n,
     };

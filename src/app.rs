@@ -1,10 +1,16 @@
 //! Application state, UI, and viewport tools.
 
+use std::collections::{HashMap, HashSet};
+
 use glam::{Vec2, Vec3};
-use mega_render::{GizmoAxis, Light, Scene, SkinningMode, Visualizer, WgpuVisualizer};
+use mega_render::{
+    GizmoAxis, Handle, Light, Material, MaterialFile, MaterialFileMaps, MaterialMaps, Mesh, Scene,
+    Skin, SkinFile, SkinningMode, Texture, Transform, Visualizer, WgpuVisualizer,
+};
 use mega_ui::{
     port_type, DockNode, DockState, NodePortSide, ScrollAxes, TextStyle, Ui, Window,
 };
+use mega_file::{MegaFile, WriteFile};
 
 use crate::driver::{DriverNodeKind, DriverSpace};
 use crate::framework::{Demo, UiCtx, SCENE_TEX};
@@ -145,6 +151,53 @@ impl AppState {
             Ok(msg) => self.status = msg,
             Err(e) => self.status = format!("Load failed: {e}"),
         }
+    }
+
+    pub fn save_dialog(&mut self) {
+        let path = rfd::FileDialog::new()
+            .add_filter("Mega File", &["mgfl"])
+            .set_file_name("rig.mgfl")
+            .save_file();
+        let Some(path) = path else {
+            return;
+        };
+        match self.save_meshes(&path) {
+            Ok(msg) => self.status = msg,
+            Err(e) => self.status = format!("Save failed: {e}"),
+        }
+    }
+
+    pub fn save_meshes(&self, path: &std::path::Path) -> Result<String, String> {
+        let mega = if path.exists() {
+            MegaFile::open(path).map_err(|e| e.to_string())?
+        } else {
+            MegaFile::create(path).map_err(|e| e.to_string())?
+        };
+        let mut files = mesh_writes(&self.scene);
+        let n_mesh = files.len();
+        let (tex_files, skipped_tex, tex_paths) = texture_writes(&self.scene)?;
+        let n_tex = tex_files.len();
+        files.extend(tex_files);
+        let mat_files = material_writes(&self.scene, &tex_paths);
+        let n_mat = mat_files.len();
+        files.extend(mat_files);
+        let skin_files = skin_writes(&self.scene, &self.rig.bind_locals);
+        let n_skin = skin_files.len();
+        files.extend(skin_files);
+        if files.is_empty() {
+            return Ok("Nothing to save.".into());
+        }
+        mega.write_files(files).map_err(|e| e.to_string())?;
+        let mut msg = format!(
+            "Saved {n_mesh} mesh(es), {n_tex} texture(s), {n_mat} material(s), {n_skin} skin(s) · {}",
+            path.file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("file")
+        );
+        if skipped_tex > 0 {
+            msg.push_str(&format!(" · skipped {skipped_tex} GPU-only texture(s)"));
+        }
+        Ok(msg)
     }
 
     pub fn load_model(&mut self, path: &std::path::Path) -> Result<String, String> {
@@ -649,6 +702,277 @@ pub fn default_dock() -> DockState {
     ))
 }
 
+const MESH_KIND: &str = "mega-render/mesh";
+const TEXTURE_KIND: &str = "mega-render/texture";
+const MATERIAL_KIND: &str = "mega-render/material";
+const SKIN_KIND: &str = "mega-render/skin";
+
+fn mesh_writes(scene: &Scene) -> Vec<WriteFile> {
+    let mut used = HashSet::new();
+    let mut files = Vec::new();
+    for (h, mesh) in scene.meshes.iter() {
+        let name = unique_asset_name(&mesh_label(scene, h), h.index, "mesh", &mut used);
+        files.push(
+            WriteFile::new(format!("/mesh/{name}"), MESH_KIND, mesh.to_bytes()).overwrite(true),
+        );
+    }
+    files
+}
+
+fn texture_writes(
+    scene: &Scene,
+) -> Result<(Vec<WriteFile>, usize, HashMap<(u32, u32), String>), String> {
+    let mut used = HashSet::new();
+    let mut files = Vec::new();
+    let mut paths = HashMap::new();
+    let mut skipped = 0;
+    for (h, tex) in scene.textures.iter() {
+        let expected = (tex.width as usize)
+            .saturating_mul(tex.height as usize)
+            .saturating_mul(4);
+        if tex.rgba.len() != expected || expected == 0 {
+            skipped += 1;
+            continue;
+        }
+        let name = unique_asset_name(&texture_label(scene, h), h.index, "tex", &mut used);
+        let path = format!("/textures/{name}.webp");
+        paths.insert(h.key(), path.clone());
+        let data = texture_to_webp(tex)?;
+        files.push(WriteFile::new(path, TEXTURE_KIND, data).overwrite(true));
+    }
+    Ok((files, skipped, paths))
+}
+
+fn material_writes(scene: &Scene, tex_paths: &HashMap<(u32, u32), String>) -> Vec<WriteFile> {
+    let mut seen = HashSet::new();
+    let mut used = HashSet::new();
+    let mut files = Vec::new();
+    for (_, n) in scene.nodes.iter() {
+        if n.mesh.is_none() {
+            continue;
+        }
+        let Some(mat_h) = n.material else {
+            continue;
+        };
+        if !seen.insert(mat_h.key()) {
+            continue;
+        }
+        let Some(mat) = scene.materials.get(mat_h) else {
+            continue;
+        };
+        let label = if n.name.is_empty() {
+            format!("mat_{}", mat_h.index)
+        } else {
+            n.name.clone()
+        };
+        let name = unique_asset_name(&label, mat_h.index, "mat", &mut used);
+        files.push(
+            WriteFile::new(
+                format!("/materials/{name}"),
+                MATERIAL_KIND,
+                material_to_bytes(mat, tex_paths),
+            )
+            .overwrite(true),
+        );
+    }
+    files
+}
+
+fn material_to_bytes(mat: &Material, tex_paths: &HashMap<(u32, u32), String>) -> Vec<u8> {
+    MaterialFile {
+        albedo: mat.albedo,
+        metallic: mat.metallic,
+        roughness: mat.roughness,
+        sss_strength: mat.sss_strength,
+        sss_color: mat.sss_color,
+        sss_curvature: mat.sss_curvature,
+        alpha_cutoff: mat.alpha_cutoff,
+        shading_model: mat.shading_model,
+        maps: match &mat.maps {
+            MaterialMaps::Single {
+                albedo,
+                normal,
+                metallic_roughness,
+            } => MaterialFileMaps::Single {
+                albedo: tex_path(tex_paths, *albedo),
+                normal: tex_path(tex_paths, *normal),
+                metallic_roughness: tex_path(tex_paths, *metallic_roughness),
+            },
+            MaterialMaps::Udim {
+                albedo,
+                normal,
+                metallic_roughness,
+            } => MaterialFileMaps::Udim {
+                albedo: udim_tex_paths(tex_paths, albedo),
+                normal: udim_tex_paths(tex_paths, normal),
+                metallic_roughness: udim_tex_paths(tex_paths, metallic_roughness),
+            },
+        },
+    }
+    .to_bytes()
+}
+
+fn tex_path(
+    paths: &HashMap<(u32, u32), String>,
+    h: Option<Handle<Texture>>,
+) -> Option<String> {
+    paths.get(&h?.key()).cloned()
+}
+
+fn udim_tex_paths(
+    paths: &HashMap<(u32, u32), String>,
+    tiles: &[(u32, Handle<Texture>)],
+) -> Vec<(u32, String)> {
+    tiles
+        .iter()
+        .filter_map(|(udim, h)| paths.get(&h.key()).cloned().map(|id| (*udim, id)))
+        .collect()
+}
+
+fn skin_writes(
+    scene: &Scene,
+    bind_locals: &HashMap<(u32, u32), Transform>,
+) -> Vec<WriteFile> {
+    let mut used = HashSet::new();
+    let mut files = Vec::new();
+    for (h, skin) in scene.skins.iter() {
+        let label = if files.is_empty() {
+            "main".into()
+        } else {
+            skin_label(scene, h)
+        };
+        let name = unique_asset_name(&label, h.index, "skin", &mut used);
+        files.push(
+            WriteFile::new(
+                format!("/skeleton/{name}"),
+                SKIN_KIND,
+                skin_to_bytes(skin, scene, bind_locals),
+            )
+            .overwrite(true),
+        );
+    }
+    files
+}
+
+fn skin_to_bytes(
+    skin: &Skin,
+    scene: &Scene,
+    bind_locals: &HashMap<(u32, u32), Transform>,
+) -> Vec<u8> {
+    let mut file = SkinFile::from_skin(skin, &scene.nodes);
+    for (i, h) in skin.joints.iter().enumerate() {
+        if let Some(&bind) = bind_locals.get(&h.key()) {
+            if let Some(local) = file.locals.get_mut(i) {
+                *local = bind;
+            }
+        }
+    }
+    file.to_bytes()
+}
+
+fn skin_label(scene: &Scene, h: Handle<Skin>) -> String {
+    for (_, n) in scene.nodes.iter() {
+        if n.skin.is_some_and(|s| s.key() == h.key()) && !n.name.is_empty() {
+            return n.name.clone();
+        }
+    }
+    if let Some(skin) = scene.skins.get(h) {
+        if let Some(joint) = skin.joints.first() {
+            if let Some(n) = scene.nodes.get(*joint) {
+                if !n.name.is_empty() {
+                    return n.name.clone();
+                }
+            }
+        }
+    }
+    format!("skin_{}", h.index)
+}
+
+fn texture_to_webp(tex: &Texture) -> Result<Vec<u8>, String> {
+    use image::codecs::webp::WebPEncoder;
+    use image::ExtendedColorType;
+
+    let mut out = Vec::new();
+    WebPEncoder::new_lossless(&mut out)
+        .encode(&tex.rgba, tex.width, tex.height, ExtendedColorType::Rgba8)
+        .map_err(|e| format!("webp encode: {e}"))?;
+    Ok(out)
+}
+
+fn unique_asset_name(label: &str, index: u32, fallback: &str, used: &mut HashSet<String>) -> String {
+    let mut name = sanitize_asset_name(label, index, fallback);
+    if !used.insert(name.clone()) {
+        name = format!("{}_{}", name, index);
+        used.insert(name.clone());
+    }
+    name
+}
+
+fn mesh_label(scene: &Scene, h: Handle<Mesh>) -> String {
+    for (_, n) in scene.nodes.iter() {
+        if n.mesh.is_some_and(|m| m.key() == h.key()) && !n.name.is_empty() {
+            return n.name.clone();
+        }
+    }
+    format!("mesh_{}", h.index)
+}
+
+fn texture_label(scene: &Scene, h: Handle<Texture>) -> String {
+    for (mi, (_, mat)) in scene.materials.iter().enumerate() {
+        match &mat.maps {
+            MaterialMaps::Single {
+                albedo,
+                normal,
+                metallic_roughness,
+            } => {
+                if albedo.is_some_and(|t| t.key() == h.key()) {
+                    return format!("mat{mi}_albedo");
+                }
+                if normal.is_some_and(|t| t.key() == h.key()) {
+                    return format!("mat{mi}_normal");
+                }
+                if metallic_roughness.is_some_and(|t| t.key() == h.key()) {
+                    return format!("mat{mi}_mr");
+                }
+            }
+            MaterialMaps::Udim {
+                albedo,
+                normal,
+                metallic_roughness,
+            } => {
+                if let Some((udim, _)) = albedo.iter().find(|(_, t)| t.key() == h.key()) {
+                    return format!("mat{mi}_albedo_{udim}");
+                }
+                if let Some((udim, _)) = normal.iter().find(|(_, t)| t.key() == h.key()) {
+                    return format!("mat{mi}_normal_{udim}");
+                }
+                if let Some((udim, _)) = metallic_roughness.iter().find(|(_, t)| t.key() == h.key())
+                {
+                    return format!("mat{mi}_mr_{udim}");
+                }
+            }
+        }
+    }
+    format!("tex_{}", h.index)
+}
+
+fn sanitize_asset_name(label: &str, index: u32, fallback: &str) -> String {
+    let s: String = label
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' => '_',
+            _ => c,
+        })
+        .collect::<String>()
+        .trim()
+        .to_string();
+    if s.is_empty() || s == "." || s == ".." {
+        format!("{fallback}_{index}")
+    } else {
+        s
+    }
+}
+
 pub struct RigApp;
 
 impl Demo for RigApp {
@@ -703,6 +1027,9 @@ impl Demo for RigApp {
                 }
                 if ui.menu_item_icon("folder_open", "Open…").clicked() {
                     ctx.state.open_dialog();
+                }
+                if ui.menu_item("Save…").clicked() {
+                    ctx.state.save_dialog();
                 }
                 if ui.menu_item("Run Script…").clicked() {
                     ctx.state.run_script_dialog();

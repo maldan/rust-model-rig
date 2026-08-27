@@ -529,7 +529,7 @@ impl<D: Demo> Host<D> {
         };
         surface.configure(&device, &config);
 
-        let mut visualizer = WgpuVisualizer::new(&device, &queue);
+        let mut visualizer = WgpuVisualizer::new(&device, &queue, format);
         let vp = (
             self.viewport_size.x.max(1.0) as u32,
             self.viewport_size.y.max(1.0) as u32,

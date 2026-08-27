@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 
 use glam::Vec3;
 use mega_render::{
-    blend_skin_point, blend_skin_vector, load_gltf, Camera, DirectionalLight, Handle, Light,
-    LineOpts, Mesh, Node, PointLight, PolyOpts, Scene, Skin, Transform,
+    blend_skin_point, blend_skin_vector, load_gltf, Camera, DirectionalLight, Handle, Light, Mesh,
+    Node, PointLight, PolyOpts, Scene, SkeletonDebugOpts, Skin, Transform,
 };
 
 #[derive(Clone, Copy)]
@@ -1022,6 +1022,7 @@ impl RigDocument {
         deform: bool,
     ) -> BoneId {
         let node = scene.nodes.insert(Node {
+            id: Node::new_id(),
             name: name.to_string(),
             parent: parent.map(|p| p.node),
             local,
@@ -1469,22 +1470,6 @@ fn deepest_descendant(rig: &RigDocument, id: BoneId) -> BoneId {
     }
 }
 
-/// Stick bone display (screen-space px). Later: expose via settings UI.
-const BONE_LINE_W: f32 = 3.5;
-const BONE_OUTLINE_W: f32 = 7.5;
-const BONE_JOINT: f32 = 8.0;
-const BONE_JOINT_OUTLINE: f32 = 12.0;
-
-const BONE_FILL: [f32; 4] = [0.86, 0.86, 0.90, 1.0];
-const BONE_OUTLINE: [f32; 4] = [0.02, 0.02, 0.04, 1.0];
-/// Selected: bright fill + darker blue outline (both blue so selection pops).
-const BONE_SEL_FILL: [f32; 4] = [0.35, 0.72, 1.0, 1.0];
-const BONE_SEL_OUTLINE: [f32; 4] = [0.06, 0.22, 0.55, 1.0];
-const IK_TARGET_FILL: [f32; 4] = [1.0, 0.55, 0.12, 1.0];
-const IK_TARGET_OUTLINE: [f32; 4] = [0.45, 0.18, 0.02, 1.0];
-const IK_POLE_FILL: [f32; 4] = [0.85, 0.35, 0.95, 1.0];
-const IK_POLE_OUTLINE: [f32; 4] = [0.35, 0.08, 0.45, 1.0];
-
 /// Blender-ish weight ramp: blue → cyan → green → yellow → red.
 fn weight_heat(w: f32) -> [f32; 4] {
     let t = w.clamp(0.0, 1.0);
@@ -1570,7 +1555,7 @@ fn rebuild_weight_overlay(scene: &Scene, rig: &RigDocument) -> Vec<(Vec3, Vec3, 
         let Some(mesh) = scene.meshes.get(mesh_h) else {
             continue;
         };
-        let (Some(joints), Some(weights)) = (&mesh.joints, &mesh.weights) else {
+        let (Some(joints), Some(weights)) = (mesh.joints.first(), mesh.weights.first()) else {
             continue;
         };
         let nverts = mesh
@@ -1682,69 +1667,43 @@ pub fn draw_weight_debug(scene: &mut Scene, rig: &mut RigDocument) {
     }
 }
 
-/// Stick skeleton: thick outline + thinner fill, joint dots. Overlay so mesh never hides it.
+/// Stick skeleton via mega-render debug draw. Overlay so mesh never hides it.
 pub fn draw_rig_debug(scene: &mut Scene, rig: &RigDocument) {
     if !rig.show_skeleton {
         return;
     }
-    // Build the world-matrix cache once per frame; `world_matrix()` walks the
-    // full ancestor chain on every call, which is O(bones * depth) if done
-    // per-bone and was the dominant cost of skeleton drawing.
+    // World-matrix cache once per frame — avoids O(bones * depth) walks.
     let wm = scene.world_matrices();
-    let segments = rig.bone_segments_cached(&wm);
-
-    // Outlines first (drawn under fills in submission order).
-    for (from, to, id) in &segments {
-        let outline = if rig.is_selected(*id) {
-            BONE_SEL_OUTLINE
-        } else {
-            BONE_OUTLINE
-        };
-        scene.debug.line(
-            *from,
-            *to,
-            LineOpts::color(outline).width(BONE_OUTLINE_W).overlay(),
-        );
-    }
-    for (from, to, id) in &segments {
-        let fill = if rig.is_selected(*id) {
-            BONE_SEL_FILL
-        } else {
-            BONE_FILL
-        };
-        scene.debug.line(
-            *from,
-            *to,
-            LineOpts::color(fill).width(BONE_LINE_W).overlay(),
-        );
-    }
-
-    // Joint dots at bone origins (points render after lines → sit on top).
-    for b in &rig.bones {
-        let pos = wm
-            .get(&b.id.node.key())
-            .copied()
-            .unwrap_or(glam::Mat4::IDENTITY)
-            .transform_point3(Vec3::ZERO);
-        let selected = rig.is_selected(b.id);
-        let (outline, fill, joint, joint_out) = match (rig.ik_control_kind(b.id), selected) {
-            (Some(IkControlKind::Target), false) => {
-                (IK_TARGET_OUTLINE, IK_TARGET_FILL, BONE_JOINT * 1.35, BONE_JOINT_OUTLINE * 1.35)
-            }
-            (Some(IkControlKind::Pole), false) => {
-                (IK_POLE_OUTLINE, IK_POLE_FILL, BONE_JOINT * 1.2, BONE_JOINT_OUTLINE * 1.2)
-            }
-            (Some(IkControlKind::Target), true) | (Some(IkControlKind::Pole), true) => {
-                (BONE_SEL_OUTLINE, BONE_SEL_FILL, BONE_JOINT * 1.4, BONE_JOINT_OUTLINE * 1.4)
-            }
-            (None, true) => (BONE_SEL_OUTLINE, BONE_SEL_FILL, BONE_JOINT, BONE_JOINT_OUTLINE),
-            (None, false) => (BONE_OUTLINE, BONE_FILL, BONE_JOINT, BONE_JOINT_OUTLINE),
-        };
-        scene
-            .debug
-            .point_ex(pos, outline, joint_out, false);
-        scene.debug.point_ex(pos, fill, joint, false);
-    }
+    let segments: Vec<(Vec3, Vec3, Handle<Node>)> = rig
+        .bone_segments_cached(&wm)
+        .into_iter()
+        .map(|(from, to, id)| (from, to, id.node))
+        .collect();
+    let joints: Vec<(Vec3, Handle<Node>)> = rig
+        .bones
+        .iter()
+        .map(|b| {
+            let pos = wm
+                .get(&b.id.node.key())
+                .copied()
+                .unwrap_or(glam::Mat4::IDENTITY)
+                .transform_point3(Vec3::ZERO);
+            (pos, b.id.node)
+        })
+        .collect();
+    let selected: Vec<Handle<Node>> = rig.selected.iter().map(|b| b.node).collect();
+    let ik_targets: Vec<Handle<Node>> = rig.ik_chains.iter().map(|c| c.target.node).collect();
+    let ik_poles: Vec<Handle<Node>> = rig.ik_chains.iter().map(|c| c.pole.node).collect();
+    scene.debug_skeleton_sticks(
+        &segments,
+        &joints,
+        &SkeletonDebugOpts {
+            selected: &selected,
+            ik_targets: &ik_targets,
+            ik_poles: &ik_poles,
+            overlay: true,
+        },
+    );
 }
 
 pub fn empty_scene() -> Scene {
